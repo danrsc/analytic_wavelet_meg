@@ -1,2 +1,2 @@
 # analytic_wavelet_meg
-Tools for running analytic wavelet transform on magnetoencephalography (MEG) data
+A library for processing large scale magnetoencephalography data using analytic wavelet transform
