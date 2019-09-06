@@ -1,38 +1,43 @@
 import os
-import argparse
+from datetime import datetime
 import numpy as np
 import mne
 
-from analytic_wavelet_meg import radians_per_ms_from_hertz, PValueFilterFn, maxima_of_transform_mne_source_estimate
+from tqdm.auto import tqdm
+
+from analytic_wavelet import ElementAnalysisMorse
+from analytic_wavelet_meg import radians_per_ms_from_hertz, PValueFilterFn, maxima_of_transform_mne_source_estimate, \
+    assign_grid_labels, common_label_count
 
 
 def load_harry_potter(subject, block):
     from paradigms import Loader
 
-    data_root = '/share/volume0/newmeg/'
-    inv_path = '/share/volume0/newmeg/{experiment}/data/inv/{subject}/' \
-               '{subject}_{experiment}_trans-D_nsb-5_cb-0_raw-{structural}-7-0.2-0.8-limitTrue-rankNone-inv.fif'
-    struct_dir = '/share/volume0/drschwar/structural'
-    session_stimuli_path = '/share/volume0/newmeg/{experiment}/meta/{subject}/sentenceBlock.mat'
-
-    recording_tuple_regex = Loader.make_standard_recording_tuple_regex(
-        'trans-D_nsb-5_cb-0_empty-4-10-2-2_band-1-150_notch-60-120_beats-head-meas_blinks-head-meas')
-    loader = Loader(session_stimuli_path, data_root, recording_tuple_regex, inv_path, struct_dir)
-
-    structurals = {
-        'A': 'struct4',
-        'B': 'struct5',
-        'C': 'struct6',
-        'D': 'krns5D',
-        'E': 'struct2',
-        'F': 'krns5A',
-        'G': 'struct1',
-        'H': 'struct3',
-        'I': 'krns5C'
+    structural_map = {
+        ('harryPotter', 'A'): 'struct4',
+        ('harryPotter', 'B'): 'struct5',
+        ('harryPotter', 'C'): 'struct6',
+        ('harryPotter', 'D'): 'krns5D',
+        ('harryPotter', 'E'): 'struct2',
+        ('harryPotter', 'F'): 'krns5A',
+        ('harryPotter', 'G'): 'struct1',
+        ('harryPotter', 'H'): 'struct3',
+        ('harryPotter', 'I'): 'krns5C'
     }
 
+    loader = Loader(
+        session_stimuli_path_format='/share/volume0/newmeg/{experiment}/meta/{subject}/sentenceBlock.mat',
+        data_root='/share/volume0/newmeg/',
+        recording_tuple_regex=Loader.make_standard_recording_tuple_regex(
+            'trans-D_nsb-5_cb-0_empty-4-10-2-2_band-1-150_notch-60-120_beats-head-meas_blinks-head-meas'),
+        inverse_operator_path_format=(
+            '/share/volume0/newmeg/{experiment}/data/inv/{subject}/'
+            '{subject}_{experiment}_trans-D_nsb-5_cb-0_raw-{structural}-7-0.2-0.8-limitTrue-rankNone-inv.fif'),
+        structural_directory='/share/volume0/drschwar/structural',
+        experiment_subject_to_structural_subject=structural_map)
+
     with mne.utils.use_log_level(False):
-        inv, labels = loader.load_structural('harryPotter', subject, structurals[subject])
+        inv, labels = loader.load_structural('harryPotter', subject)
         mne_raw, stimuli, _ = loader.load_block('harryPotter', subject, block)
 
     epoch_start_times = np.array(list(s['time_stamp'] for s in stimuli))
@@ -42,11 +47,10 @@ def load_harry_potter(subject, block):
     return mne_raw, inv, labels, stimuli, epoch_start_times, duration
 
 
-def make_harry_potter_element_analysis_block(output_path, subject, block, label_name=None):
+def make_element_analysis_block(output_path, load_fn, subject, block, label_name=None):
     from analytic_wavelet import ElementAnalysisMorse, MaximaPValueInterp1d
 
-    # this part is application specific - swap out for your own loading
-    mne_raw, inv, labels, stimuli, epoch_start_times, duration = load_harry_potter(subject, block)
+    mne_raw, inv, labels, stimuli, epoch_start_times, epoch_duration = load_fn(subject, block)
 
     label = None
     if label_name is not None:
@@ -70,7 +74,7 @@ def make_harry_potter_element_analysis_block(output_path, subject, block, label_
 
     (indices_stimuli, indices_source, indices_scale, indices_time), maxima_coefficients, interp_fs = (
         maxima_of_transform_mne_source_estimate(
-            ea_morse, fs, mne_raw, inv, np.array(list(s['time_stamp'] for s in stimuli)), source_estimate_label=label,
+            ea_morse, fs, mne_raw, inv, epoch_start_times, epoch_duration, source_estimate_label=label,
             filter_fn=p_value_func, lambda2=1))
 
     output_dir = os.path.split(output_path)[0]
@@ -84,67 +88,62 @@ def make_harry_potter_element_analysis_block(output_path, subject, block, label_
         element_beta=ea_morse.element_beta,
         scale_frequencies=fs,
         indices_stimuli=indices_stimuli,
-        indices_source=indices_source,
+        indices_source=indices_source,  # should have called this vertices in the output :(
         indices_scale=indices_scale,
         indices_time=indices_time,
         maxima_coefficients=maxima_coefficients,
         interpolated_scale_frequencies=interp_fs)
 
 
-def create_python_exec_bash(working_directory, python_string, bash_script_path, log_path):
+def _compute_shared_grid_element_counts(ea_path):
+    ea_block = np.load(ea_path)
+
+    ea_morse = ElementAnalysisMorse(ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
+    c_hat, _, f_hat = ea_morse.event_parameters(
+        ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
+
+    scale_frequencies = ea_block['scale_frequencies']
+    grid, grid_labels = assign_grid_labels(
+        ea_morse, scale_frequencies[np.arange(0, len(scale_frequencies), 10)],
+        ea_block['indices_time'], f_hat, batch_size=100000)
+
+    combine_source_labels = np.concatenate([
+        np.expand_dims(ea_block['indices_stimuli'], 1), np.expand_dims(grid_labels, 1)], axis=1)
+
+    # note: indices_source is bad naming - these are the actual vertices
+    unique_vertices, _, shared_labels = common_label_count(ea_block['indices_source'], combine_source_labels)
+    return unique_vertices, shared_labels, grid, grid_labels
+
+
+def compute_shared_grid_element_counts(element_analysis_dir, subjects=None, label_name=None):
     """
-    Creates a bash script to start Python and call the Python script indicated by python_filename.
-    :param working_directory: The working directory for Python.
-    :param python_string: The python command to run
-    :param bash_script_path: The path at which to write the bash_script.
-    :param log_path: The log path for Python.
+    Computes how often two dipoles have events in the same 'grid element'. A grid element divides
+    the time-scale plane into boxes that are log-scaled on the scale axis and scaled according to the
+    wavelet footprint at the appropriate frequency on the time axis. Thus, boxes are larger in the scale-axis
+    and smaller in the time axis as the frequency increases.
+    Args:
+        element_analysis_dir: The directory where element analysis files can be found. For example:
+            '/share/volume0/<your user name>/data_sets/harry_potter/element_analysis'
+        subjects: Which subjects to run the counts on. Defaults to all subjects.
+        label_name: If specified, analysis is restricted to a single FreeSurfer label
+
+    Returns:
+        None. Saves an output file for each subject, containing, for each block, the keys:
+            <block>_vertices: The unique vertices for the block, in the order of the grid element counts. As long
+                as the element analysis has been run in a consistent way, these should be the same across all blocks.
+            <block>_vertex_shared_grid_element_count: The (num_vertices, num_vertices) matrix of counts giving how
+                often two vertices have events in the same grid-element. The events must occur in the grid element
+                within the same epoch in order to be counted as being shared. The count for a grid element within an
+                epoch is the minimum of the count of events from vertex 1 and vertex 2 within that element in that
+                epoch
+            <block>_grid: A (num_grid_elements, 4) array giving the bounding boxes for each grid element as:
+                (time_lower, time_upper, freq_lower, freq_upper). Note that grid-element assignments are done by
+                nearest-neighbor to the center point of each grid element. As long as element analysis has been run
+                in a consistent way, these should be the same across all blocks.
+            <block>_grid_elements: A 1d array of the labels of which grid element each event is assigned to.
+        The output also contains the key "blocks", which gives the list of blocks in the output.
     """
-
-    with open(bash_script_path, 'w') as output_bash:
-        output_bash.write('#!/bin/bash\n')
-        output_bash.write('cd {0}\n'.format(working_directory))
-        output_bash.write(
-            'printf "HOSTNAME: %s\\n\\n" "$HOSTNAME" > {0}\n'.format(log_path))
-        output_bash.write('python {0} | tee -a {1}'.format(python_string, log_path))
-        output_bash.write('\n')
-
-
-def queue_job(job_filename, resource_limits_string, pool):
-
-    import subprocess
-
-    """
-    queues a single job and returns the id for that job
-    :param job_filename: The path to the bash script for the job.
-    :param resource_limits_string: The resource limits for the job, this string is passed to qsub's -l parameter.
-    :param pool_env: The pool environment to use for this job. Used to provide default resource limits.
-    :type pool_env: pool_environment.PoolEnv
-    :param pool: The pool on which to queue this job.
-    :type pool: string
-    """
-    if resource_limits_string is None:
-        ppn = {
-            'default': 16,
-            'pool2': 8,
-            'gpu': 16
-        }
-
-        resource_limits_string = 'nodes=1'.format(ppn[pool])
-
-    job_dir = os.path.split(job_filename)[0]
-
-    subprocess.check_output(['chmod', 'g+x', job_filename])
-    job = subprocess.check_output([
-        'qsub',
-        '-l', 'nodes=1:ppn=16',
-        '-l', 'walltime=600:00:00',
-        '-q', pool, job_filename], cwd=job_dir)
-    return job.strip()
-
-
-def create_qsub_jobs(pool, subjects=None, blocks=None, label=None):
-
-    from itertools import product
+    # element_analysis_dir = '/share/volume0/drschwar/data_sets/harry_potter/element_analysis'
 
     all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'H', 'I'
     all_blocks = '1', '2', '3', '4'
@@ -152,84 +151,38 @@ def create_qsub_jobs(pool, subjects=None, blocks=None, label=None):
     if subjects is None:
         subjects = all_subjects
 
-    if blocks is None:
-        blocks = all_blocks
-
     for s in subjects:
         if s not in all_subjects:
             raise ValueError('Unknown subject: {}'.format(s))
 
-    for b in blocks:
-        if b not in all_blocks:
-            raise ValueError('Unknown block: {}'.format(b))
+    # this takes about 1 hour per block
+    for subject in tqdm(subjects):
 
-    job_directory = '/home/drschwar/element_analysis_jobs'
+        tqdm.write('Beginning analysis for subject {} at {}'.format(subject, datetime.now()))
 
-    if not os.path.exists(job_directory):
-        os.makedirs(job_directory)
+        result = {'blocks': all_blocks}
+        for block in tqdm(all_blocks, leave=False):
+            if label_name is not None:
+                ea_path = os.path.join(
+                    element_analysis_dir,
+                    'harry_potter_element_analysis_{}_{}_{}.npz'.format(subject, block, label_name))
+            else:
+                ea_path = os.path.join(element_analysis_dir,
+                                       'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
+            unique_vertices, shared_element_counts, grid, grid_labels = _compute_shared_grid_element_counts(ea_path)
+            result['{}_vertices'.format(block)] = unique_vertices
+            result['{}_vertex_shared_grid_element_count'.format(block)] = shared_element_counts
+            result['{}_grid'.format(block)] = grid
+            result['{}_grid_elements'.format(block)] = grid_labels
 
-    output_directory = '/share/volume0/drschwar/data_sets/harry_potter/element_analysis'
+            # get rid of these references so we can free up memory after we write result (i.e. on the last block)
+            del unique_vertices
+            del shared_element_counts
+            del grid
+            del grid_labels
 
-    for s, b in product(subjects, blocks):
-
-        if label is not None:
-            job_name = 'harry_potter_element_analysis_{}_{}_{}'.format(s, b, label)
-            arg_str = '--subject {subject} --block {block} --label {label} --output_path {output}'
-        else:
-            job_name = 'harry_potter_element_analysis_{}_{}'.format(s, b, label)
-            arg_str = '--subject {subject} --block {block} --output_path {output}'
-
-        output_path = os.path.join(output_directory, job_name + '.npz')
-        arg_str = arg_str.format(subject=s, block=b, label=label, output=output_path)
-
-        bash_path = os.path.join(job_directory, job_name + '.sh')
-
-        create_python_exec_bash(
-            os.path.expanduser('~/src/bert_erp/'),
-            'element_analysis_harry_potter.py ' + arg_str,
-            bash_path,
-            os.path.join(job_directory, job_name + '.log'))
-
-        queue_job(bash_path, 'mem=10gb,walltime=216000', pool)
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--subject', action='store', default='')
-    parser.add_argument('--block', action='store', default='')
-    parser.add_argument('--label', action='store', default='')
-    parser.add_argument('--output_path', action='store', default='')
-    parser.add_argument('--queue', action='store', default='')
-
-    args = parser.parse_args()
-    arg_subjects = args.subject
-    if arg_subjects == '':
-        arg_subjects = None
-    else:
-        arg_subjects = [s.strip() for s in arg_subjects.split(',')]
-
-    arg_blocks = args.block
-    if arg_blocks == '':
-        arg_blocks = None
-    else:
-        arg_blocks = [b.strip() for b in arg_blocks.split(',')]
-
-    arg_label = None if args.label == '' else args.label
-    arg_output_path = None if args.output_path == '' else args.output_path
-
-    args_queue = None if args.queue == '' else args.queue
-
-    if args_queue is not None:
-        create_qsub_jobs(args_queue, arg_subjects, arg_blocks, arg_label)
-    else:
-
-        if arg_output_path is None:
-            raise ValueError('Output path is required')
-
-        import sys
-        sys.path.append('/home/drschwar/src/analytic_wavelet')
-        sys.path.append('/home/drschwar/src/paradigms')
-
-        from itertools import product
-        for s, b in product(arg_subjects, arg_blocks):
-            make_harry_potter_element_analysis_block(arg_output_path, s, b, arg_label)
+        output_file_name = 'shared_grid_element_counts_{subject}.npz'
+        if label_name is not None:
+            output_file_name = 'shared_grid_element_counts_{subject}_{label}.npz'
+        np.savez(
+            os.path.join(element_analysis_dir, output_file_name.format(subject=subject, label=label_name)), **result)
