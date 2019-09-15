@@ -1,5 +1,6 @@
 from concurrent.futures import ProcessPoolExecutor
 from itertools import repeat
+from datetime import datetime
 import numpy as np
 from numba import njit, prange
 from scipy.fftpack import next_fast_len
@@ -15,8 +16,6 @@ __all__ = [
     'PValueFilterFn',
     'hertz_from_radians_per_ms',
     'radians_per_ms_from_hertz',
-    'time_in_cycle_points',
-    'gaussian_mixtures_per_epoch',
     'common_label_count',
     'source_cluster',
     'assign_grid_labels',
@@ -153,16 +152,16 @@ def maxima_of_transform_mne_source_estimate(
             https://github.com/mne-tools/mne-python/issues/4131
 
     Returns:
-        indices_maxima: The coordinates of each maximum. If epoch_start_times is provided, this is a tuple of
-                (epochs, vertices, indices_scale_frequency, indices_time)
-            otherwise, this is a tuple of
-                (vertices, indices_scale_frequency, indices_time)
-            Note that vertices is not necessarily the index within the stc, but is the actual vertex number. Thus,
-            maxima that are discovered from a run restricted to a specific label will have the same coordinates as
-            maxima that are discovered from an unrestricted run.
+        indices_maxima: The flat index of each maximum, which can be converted to coordinates using the returned shape
         maxima_coefficients: The wavelet coefficients at the maxima
         interp_scale_freq: The interpolated scale-frequencies at the maxima. These can make some of the downstream
             estimates better than using the discrete scale-frequency indices.
+        shape: If epoch_start_times is provided, this is a tuple of
+                (num_epochs, num_sources, num_scale_frequencies, num_timepoints_per_epoch)
+            otherwise, this is a tuple of
+                (num_sources, num_scale_frequencies, num_timepoints)
+        vertices: A tuple of 2 1d arrays (left hemisphere, right hemisphere) giving the vertex numbers associated
+            with the source estimate.
         indicator_isolated: A boolean array which is True for isolated events and False otherwise. Only returned if
             isolated_only is False
     """
@@ -192,16 +191,20 @@ def maxima_of_transform_mne_source_estimate(
     else:
         num_sources = inv['nsource']
 
-    p_bar = tqdm(total=int(np.ceil((end_index - start_index) / num_timepoints_per_batch)) * num_sources)
+    total_batches = int(np.ceil((end_index - start_index) / num_timepoints_per_batch))
+    p_bar = tqdm(total=total_batches * num_sources)
 
     result_indices_maxima = None
     result_maxima_coefficients = None
     result_interp_fs = None
     result_indicator_isolated = None
     vertices = None
+    num_sources = None
 
     try:
-        for index_time_start in range(start_index, end_index, num_timepoints_per_batch):
+        # tqdm doesn't have great support for writing to a file write now, so do this manually
+        start_time = datetime.now()
+        for index_of_time_batch, index_time_start in enumerate(range(start_index, end_index, num_timepoints_per_batch)):
             batch_start = max(index_time_start - max_footprint, 0)
             batch_length = min(num_timepoints_per_batch, end_index - index_time_start)
             padded_batch_length = next_fast_len(index_time_start + batch_length + max_footprint - batch_start)
@@ -215,7 +218,9 @@ def maxima_of_transform_mne_source_estimate(
                     source_estimate = source_estimate.in_label(source_estimate_label)
 
             sources = source_estimate.data
-            vertices = np.concatenate(source_estimate.vertices)
+            vertices = source_estimate.vertices
+            num_sources = sources.shape[0]
+            assert(len(vertices[0]) + len(vertices[1]) == num_sources)
             del mne_raw_batch  # save some memory
             del source_estimate  # save some memory
 
@@ -260,6 +265,21 @@ def maxima_of_transform_mne_source_estimate(
                             if not isolated_only:
                                 result_indicator_isolated.extend(indicator_isolated)
                     p_bar.update()
+
+            # manually write to output so we get some indication in the log file of where
+            # we are. There are ways to do this with tqdm itself, but it's a bit complicated
+            # and there are issues so we just do this way
+            elapsed_time = datetime.now() - start_time
+            avg_time = elapsed_time / (index_of_time_batch + 1)
+            est_time = (total_batches - index_of_time_batch - 1) * avg_time
+            tqdm.write('{percent:.3f}% | {count} / {total} [{elapsed}<{est}, {hours_per_it:.3f} h/it'.format(
+                percent=(index_of_time_batch + 1) / total_batches * 100,
+                count=index_of_time_batch + 1,
+                total=total_batches,
+                elapsed=tqdm.format_interval(int(elapsed_time.total_seconds())),
+                est=tqdm.format_interval(int(est_time.total_seconds())),
+                hours_per_it=avg_time.total_seconds() / 3600))
+
         p_bar.refresh()
     finally:
         p_bar.close()
@@ -269,9 +289,6 @@ def maxima_of_transform_mne_source_estimate(
     result_interp_fs = np.array(result_interp_fs)
     if not isolated_only:
         result_indicator_isolated = np.array(result_indicator_isolated)
-
-    # convert source indices to vertices
-    result_indices_maxima = (vertices[result_indices_maxima[0]],) + result_indices_maxima[1:]
 
     # put these back in row-major order
     assert(len(result_indices_maxima) == 3)
@@ -292,9 +309,17 @@ def maxima_of_transform_mne_source_estimate(
         if not isolated_only:
             result_indicator_isolated = result_indicator_isolated[indicator_epoch]
 
-    if isolated_only:
-        return result_indices_maxima, result_maxima_coefficients, result_interp_fs
-    return result_indices_maxima, result_maxima_coefficients, result_interp_fs, result_indicator_isolated
+        shape = len(epoch_start_times), num_sources, len(scale_frequencies), epoch_duration
+    else:
+        shape = num_sources, len(scale_frequencies), end_index - start_index
+
+    result_indices_maxima = np.ravel_multi_index(result_indices_maxima, shape)
+
+    to_return = result_indices_maxima, result_maxima_coefficients, result_interp_fs, shape, vertices
+    if not isolated_only:
+        to_return = to_return + (result_indicator_isolated,)
+
+    return to_return
 
 
 def make_epochs(
@@ -302,7 +327,6 @@ def make_epochs(
         time,
         start_times,
         duration,
-        make_time_relative=True,
         time_axis=-1):
     """
     Modifies the coordinates of maxima to account for epochs in the data
@@ -311,8 +335,6 @@ def make_epochs(
         time: The times corresponding to each time index, usually mne_raw.times
         start_times: The start times of each epoch in the same units as time
         duration: The duration of each epoch in number of timepoints
-        make_time_relative: If True, then the index in time in the returned coordinates will be relative to the
-            start of the epoch
         time_axis: Which axis contains the time indices
     Returns:
         New coordinates. The first coordinate will be the epoch, the other coordinates are in the same order as
@@ -320,17 +342,18 @@ def make_epochs(
     """
     start_indices = np.searchsorted(time, start_times, 'left')
     indices_epochs = -1 * np.ones_like(coordinates[0])
-    if make_time_relative:
-        # copy the time axis so this operation doesn't overwrite
-        coordinates = (
-                coordinates[:time_axis] + np.copy(coordinates[time_axis]) + coordinates[time_axis + 1:])
+    # copy the time axis so this operation doesn't overwrite
+    if time_axis < 0:
+        time_axis = time_axis + len(coordinates)
+        assert(0 <= time_axis < len(coordinates))
+    coordinates = (
+        coordinates[:time_axis] + (np.copy(coordinates[time_axis]),) + coordinates[time_axis + 1:])
     for index_stimulus, start_index in enumerate(start_indices):
         indicator_stimulus = np.logical_and(
             coordinates[time_axis] >= start_index,
             coordinates[time_axis] < start_index + duration)
         indices_epochs[indicator_stimulus] = index_stimulus
-        if make_time_relative:
-            coordinates[time_axis][indicator_stimulus] = coordinates[time_axis][indicator_stimulus] - start_index
+        coordinates[time_axis][indicator_stimulus] = coordinates[time_axis][indicator_stimulus] - start_index
 
     return (indices_epochs,) + coordinates
 
@@ -343,34 +366,28 @@ def hertz_from_radians_per_ms(x):
     return x * 1000 / (2 * np.pi)
 
 
-def time_in_cycle_points(interpolated_scale_frequencies, indices_time, c_hat, f_hat):
+def assign_grid_labels(ea_morse, scale_frequencies, indices_time, f_hat, batch_size=None):
     """
-    Returns 4d points which are more amenable to Euclidean distance computations. c_hat is broken in into its real
-    and imaginary components, and indices_time is rescaled by interp_fs to convert time to radians. All values are
-    then normalized by their maximums.
+    Divides the time-scale plane of each epoch into a grid, and assigns to each point described by the coordinates
+    (indices_time, f_hat) a grid-element label indicating which grid-element the point belongs to. The given
+    scale_frequencies are used as the lower and upper frequency bounds in the grid, so they should be sub-sampled before
+    being passed into this function if fewer frequency bins are desired. The time bins are created by using the
+    footprint of the generalized morse wavelet at each scale as the width of the bin. The footprint is computed by
+    using the higher frequency bound of each frequency bin. The grid-element centers are computed from these bounds,
+    and the points are assigned the the grid-element centers that are nearest to them.
     Args:
-        interpolated_scale_frequencies: The scale frequency coordinates of the samples output by
-            maxima_of_transform_mne_source_estimate
-        indices_time: The time coordinates of the samples output by maxima_of_transform_mne_source_estimate
-        c_hat: The estimated complex coefficient of the samples output by ElementAnalysisMorse.event_parameters
-        f_hat: The estimated frequency of the samples output by ElementAnalysisMorse.event_parameters
+        ea_morse: An instance of ElementAnalysisMorse, used to compute the bins.
+        scale_frequencies: The scale_frequencies that define the bin edges along the scale axis
+        indices_time: The time coordinates of each point.
+        gf_hat: The frequency coordinates of each point (in radians).
+        batch_size: The number of points to assign simultaneously. This keeps the memory down.
 
     Returns:
-        points: An array of shape (n_samples, 4)
+        grid: A (num_grid_elements, 4) array giving the bounds of each bin as
+            (lower_time, upper_time, lower_freq, upper_freq)
+        grid_assignments: A 1d array of grid labels between 0 and num_grid_elements which is the same length
+            as indices_time
     """
-    w_x = np.real(c_hat)
-    w_y = np.imag(c_hat)
-
-    return np.concatenate([
-        np.expand_dims(w_x / np.max(np.abs(w_x)), 1),
-        np.expand_dims(w_y / np.max(np.abs(w_y)), 1),
-        np.expand_dims(f_hat / np.max(f_hat), 1),
-        np.expand_dims(
-            (interpolated_scale_frequencies * indices_time
-             / (np.max(indices_time) * np.max(interpolated_scale_frequencies))), 1)], axis=1)
-
-
-def assign_grid_labels(ea_morse, scale_frequencies, indices_time, f_hat, batch_size=None):
     # make sure these are in descending order
     scale_frequencies = scale_frequencies[np.argsort(-scale_frequencies)]
     footprint = ea_morse.analyzing_morse.footprint(scale_frequencies)
@@ -383,8 +400,8 @@ def assign_grid_labels(ea_morse, scale_frequencies, indices_time, f_hat, batch_s
             grid.append((j - foot, j, low_freq, high_freq))
     grid = np.array(grid)
     grid_centers = np.concatenate([
-        np.sum(grid[:, :2], axis=1, keepdims=True),
-        np.sum(grid[:, 2:], axis=1, keepdims=True)], axis=1)
+        np.mean(grid[:, :2], axis=1, keepdims=True),
+        np.mean(grid[:, 2:], axis=1, keepdims=True)], axis=1)
     if batch_size is None:
         distances = cdist(
             np.concatenate([np.expand_dims(indices_time, 1), np.expand_dims(f_hat, 1)], axis=1), grid_centers)
@@ -397,86 +414,6 @@ def assign_grid_labels(ea_morse, scale_frequencies, indices_time, f_hat, batch_s
                                 np.expand_dims(f_hat[batch:(batch + batch_size)], 1)], axis=1), grid_centers)
             grid_assignments[batch:(batch + batch_size)] = np.argmin(distances, axis=1)
     return grid, grid_assignments
-
-
-def gaussian_mixtures_per_epoch(
-        indices_epoch,
-        points,
-        partition_labels=None,
-        return_indices_in_labels=False,
-        n_components=1,
-        **mixture_kwargs):
-    """
-    Fits a sklearn.GaussianMixture model independently for each epoch using indices_time, c_hat, and f_hat as the
-    coordinates of the samples. Useful for identifying maxima across dipoles that are likely to be associated with
-    the same event
-    Args:
-        indices_epoch: The epoch coordinates of each point
-        points: The points to cluster
-        partition_labels: If provided, clusters are computed within partition (n_components per partition)
-        return_indices_in_labels: If True, the index of each sample within all samples belonging to a label will also
-            be computed and returned. This is useful for creating a dense representation
-        n_components: The number of Gaussians in each Gaussian mixture
-        **mixture_kwargs: Other arguments to the GaussianMixture model
-
-    Returns:
-        labels: The cluster labels for each point. The labels are different for each epoch, so the total number of
-            unique labels is len(np.unique(indices_epoch)) * n_components
-        prob: The probability that a point belongs to the given label
-        indices_in_labels: The index of the current sample within all samples belonging to a label. Useful for creating
-            a dense representation. Only returned if return_indices_in_labels is True
-    """
-    from sklearn.mixture import GaussianMixture
-
-    labels = -1 * np.ones_like(indices_epoch)
-    prob = None
-
-    def _make_iter():
-        unique_epochs = np.unique(indices_epoch)
-        if partition_labels is not None:
-            unique_partition_labels = np.unique(partition_labels)
-
-            def _iter_both():
-                for e in unique_epochs:
-                    for p_lbl in unique_partition_labels:
-                        yield np.logical_and(indices_epoch == e, partition_labels == p_lbl)
-
-            return len(unique_epochs) * len(unique_partition_labels), _iter_both
-
-        else:
-            def _iter_epoch():
-                for e in unique_epochs:
-                    yield indices_epoch == e
-
-            return len(unique_epochs), _iter_epoch
-
-    total, iterator = _make_iter()
-
-    indices_in_labels = None
-    if return_indices_in_labels:
-        indices_in_labels = -1 * np.ones_like(indices_epoch)
-
-    for idx, indicator_points in tqdm(enumerate(iterator()), total=total, mininterval=1, miniters=5):
-
-        p = points[indicator_points]
-
-        gm = GaussianMixture(n_components, **mixture_kwargs)
-        current_labels = gm.fit_predict(p)
-        labels[indicator_points] = idx * n_components + current_labels
-        current_prob = np.max(gm.predict_proba(p), axis=1)
-        if prob is None:
-            prob = np.zeros(len(indices_epoch), current_prob.dtype)
-        prob[indicator_points] = current_prob
-        if return_indices_in_labels:
-            indices_points = np.flatnonzero(indicator_points)
-            for current_label in np.unique(current_labels):
-                indicator_current = current_label == current_labels
-                indices_in_labels[indices_points[indicator_current]] = \
-                    np.cumsum(indicator_current)[indicator_current] - 1
-
-    if return_indices_in_labels:
-        return labels, prob, indices_in_labels
-    return labels, prob
 
 
 def cumulative_indices_from_unique_inverse(inverse, counts):
@@ -517,22 +454,53 @@ def _vertex_label_count(vertex_label):
     return unique_labels, unique_vertices, counts_
 
 
+def _vertex_label_count_from_flat_indices(flat_indices, shape, vertex_axis, label_axes):
+    indices = np.unravel_index(flat_indices, shape)
+    if not np.isscalar(label_axes):
+        vertex_label = [indices[vertex_axis]] + list(np.expand_dims(indices[ax], 1) for ax in label_axes)
+    else:
+        vertex_label = [indices[vertex_axis], indices[label_axes]]
+
+    vertex_label = np.concatenate(list(np.expand_dims(ind, 1) for ind in vertex_label), axis=1)
+
+    vertex_label, counts = np.unique(vertex_label, axis=0, return_counts=True)
+    unique_labels, label_id = np.unique(vertex_label[:, 1:], return_inverse=True, axis=0)
+    unique_vertices, vertex_id = np.unique(vertex_label[:, 0], return_inverse=True)
+
+    # put counts in a dense representation that is addressable by vertex and label
+    counts_ = np.zeros((len(unique_labels), len(unique_vertices)), counts.dtype)
+    counts_[(label_id, vertex_id)] = counts
+    return unique_labels, unique_vertices, counts_
+
+
 @njit(parallel=True)
 def _numba_sum_min(x):
-    result = np.zeros((x.shape[1], x.shape[1]), x.dtype)
+
+    count = (x.shape[1] * (x.shape[1] + 1)) // 2
+
+    result = np.zeros(count, x.dtype)
 
     for lbl in prange(x.shape[0]):
-        label_result = np.zeros((x.shape[1], x.shape[1]), x.dtype)
+        label_result = np.zeros(count, x.dtype)
+        k = 0
         for i in range(x.shape[1]):
             for j in range(i, x.shape[1]):
                 if x[lbl, i] < x[lbl, j]:
-                    label_result[i, j] = x[lbl, i]
-                    label_result[j, i] = x[lbl, i]
+                    label_result[k] = x[lbl, i]
                 else:
-                    label_result[i, j] = x[lbl, j]
-                    label_result[j, i] = x[lbl, j]
+                    label_result[k] = x[lbl, j]
+                k += 1
         result += label_result
-    return result
+
+    final_result = np.zeros((x.shape[1], x.shape[1]), result.dtype)
+    k = 0
+    for i in range(x.shape[1]):
+        for j in range(i, x.shape[1]):
+            final_result[i, j] = result[k]
+            final_result[j, i] = result[k]
+            k += 1
+
+    return final_result
 
 
 def segment_combine_events(segment_labels, c_hat, power_weighted_dict=None, unweighted_dict=None):
@@ -543,11 +511,20 @@ def segment_combine_events(segment_labels, c_hat, power_weighted_dict=None, unwe
             (epoch, combined-source, grid-label) for each event. The number of events is along axis=0
         c_hat: The estimated complex coefficient for each event. This will be used to compute the power for
             power-weighted combinations, and will also be used to compute the magnitude of the combined event
-        power_weighted_dict: Each item in the dictionary should be a 1d array which will be combined
-        unweighted_dict:
+        power_weighted_dict: Each item in the dictionary should be a 1d array which will be combined according to
+            segment_labels by using a weighted average within label, weighted by the power at each point
+            (the power is computed from c_hat)
+        unweighted_dict: Each item in the dictionary should be a 1d array which will be combined according to
+            segment_labels using a simple average within label.
 
     Returns:
-
+        unique_segment_labels: An array of the unique segment labels
+        modulus: The L2 norm of of the modulus of c_hat within label
+        power_weighted_result: A dictionary having the same keys as power_weighted_dict, containing the
+            weighted averages of each item from power_weighted_dict within label. Only returned if power_weighted_dict
+            is not None
+        unweighted_result: A dictionary having the same keys as unweighted_dict, containing the averages of each item
+            from unweighted_dict within label. Only returned if unweighted_dict is not None
     """
     unique_segment_labels, segment_labels = np.unique(segment_labels, axis=0, return_inverse=True)
     indices_sort = np.argsort(segment_labels)
@@ -630,16 +607,21 @@ def common_label_count(vertices, labels, batch_size=100000):
             map_labels, map_vertices = np.meshgrid(map_labels, map_vertices, indexing='ij')
             counts[(np.reshape(map_labels, -1), np.reshape(map_vertices, -1))] += np.reshape(source_counts, -1)
 
-    # note: this step takes about an hour for a full block on the GPU servers
+    # sum out the labels to give a count per-source. This can be useful
+    # if we decide to use something like pointwise-mutual information
+    # downstream
+    independent_counts = np.sum(counts, axis=0)
+
+    # note: this step takes 1 - 4 hours for a full block on the GPU servers
     # You need to have a lot of memory to run this, it uses about 80GB
-    result = _numba_sum_min(counts)
+    joint_counts = _numba_sum_min(counts)
 
-    return unique_vertices, unique_labels, result
+    return unique_vertices, unique_labels, joint_counts, independent_counts
 
 
-def source_cluster(source_affinity_matrix, n_clusters, vertices, **spectral_kwargs):
+def source_cluster(source_affinity_matrix, n_clusters, sources, **spectral_kwargs):
     from sklearn.cluster import SpectralClustering
     spectral_clustering = SpectralClustering(n_clusters=n_clusters, affinity='precomputed', **spectral_kwargs)
     source_clusters = spectral_clustering.fit_predict(source_affinity_matrix)
-    _, indices_vertices = np.unique(vertices, return_inverse=True)
+    _, indices_vertices = np.unique(sources, return_inverse=True)
     return source_clusters, source_clusters[indices_vertices]

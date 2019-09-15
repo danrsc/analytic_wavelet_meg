@@ -1,7 +1,6 @@
 import os
 import argparse
 import subprocess
-from element_analysis_harry_potter import make_element_analysis_block, load_harry_potter
 
 
 def create_python_exec_bash(working_directory, python_string, bash_script_path, log_path):
@@ -44,7 +43,7 @@ def queue_job(job_filename, resource_limits_string, pool):
             raise ValueError('Unrecognized pool. Please provide your own resource string')
 
         resource_limits_string = (
-            'nodes=1:ppn=16'.format(ppn[pool]),
+            'nodes=1:ppn={}'.format(ppn[pool]),
             'walltime=600:00:00')
 
     if not isinstance(resource_limits_string, (tuple, list)):
@@ -58,7 +57,10 @@ def queue_job(job_filename, resource_limits_string, pool):
     job_dir = os.path.split(job_filename)[0]
 
     subprocess.check_output(['chmod', 'g+x', job_filename])
-    job = subprocess.check_output(['qsub'] + resource_limits + ['-q', pool, job_filename], cwd=job_dir)
+
+    subprocess_args = ['qsub'] + resource_limits + ['-q', pool, job_filename]
+    # print(subprocess_args)
+    job = subprocess.check_output(subprocess_args, cwd=job_dir)
     return job.strip()
 
 
@@ -100,10 +102,10 @@ def create_pbs_jobs(job_directory, output_directory, pool, subjects=None, blocks
 
         if label is not None:
             job_name = 'harry_potter_element_analysis_{}_{}_{}'.format(s, b, label)
-            arg_str = '--subject {subject} --block {block} --label {label} --output_path {output}'
+            arg_str = '--subject {subject} --block {block} --label {label} --output_dir {output}'
         else:
             job_name = 'harry_potter_element_analysis_{}_{}'.format(s, b, label)
-            arg_str = '--subject {subject} --block {block} --output_path {output}'
+            arg_str = '--subject {subject} --block {block} --output_dir {output}'
 
         output_path = os.path.join(output_directory, job_name + '.npz')
         arg_str = arg_str.format(subject=s, block=b, label=label, output=output_path)
@@ -111,12 +113,12 @@ def create_pbs_jobs(job_directory, output_directory, pool, subjects=None, blocks
         bash_path = os.path.join(job_directory, job_name + '.sh')
 
         create_python_exec_bash(
-            os.path.expanduser('~/src/bert_erp/'),
-            'element_analysis_harry_potter.py ' + arg_str,
+            os.path.expanduser('~/src/analytic_wavelet_meg/'),
+            'element_analysis_harry_potter_pbs.py ' + arg_str,
             bash_path,
             os.path.join(job_directory, job_name + '.log'))
 
-        queue_job(bash_path, 'mem=10gb,walltime=216000', pool)
+        queue_job(bash_path, None, pool)
 
 
 if __name__ == '__main__':
@@ -172,6 +174,8 @@ if __name__ == '__main__':
         import sys
         sys.path.append('/home/drschwar/src/analytic_wavelet')
         sys.path.append('/home/drschwar/src/paradigms')
+
+        from element_analysis_harry_potter import make_element_analysis_block, load_harry_potter
 
         from itertools import product
         for s, b in product(arg_subjects, arg_blocks):
