@@ -78,7 +78,7 @@ def create_pbs_jobs(job_directory, output_directory, pool, subjects=None, blocks
 
     from itertools import product
 
-    all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'H', 'I'
+    all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
     all_blocks = '1', '2', '3', '4'
 
     if subjects is None:

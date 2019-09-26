@@ -3,9 +3,9 @@ from itertools import repeat
 from datetime import datetime
 import numpy as np
 from numba import njit, prange
+from bottleneck import median
 from scipy.fftpack import next_fast_len
 from scipy.signal import detrend
-from scipy.spatial.distance import cdist
 import mne
 
 from tqdm.auto import tqdm
@@ -17,10 +17,12 @@ __all__ = [
     'hertz_from_radians_per_ms',
     'radians_per_ms_from_hertz',
     'common_label_count',
-    'source_cluster',
+    'make_grid',
     'assign_grid_labels',
     'cumulative_indices_from_unique_inverse',
-    'segment_combine_events']
+    'segment_combine_events',
+    'segment_median',
+    'k_pod']
 
 
 class PValueFilterFn:
@@ -366,28 +368,24 @@ def hertz_from_radians_per_ms(x):
     return x * 1000 / (2 * np.pi)
 
 
-def assign_grid_labels(ea_morse, scale_frequencies, indices_time, f_hat, batch_size=None):
+def make_grid(ea_morse, num_timepoints, scale_frequencies):
     """
-    Divides the time-scale plane of each epoch into a grid, and assigns to each point described by the coordinates
-    (indices_time, f_hat) a grid-element label indicating which grid-element the point belongs to. The given
-    scale_frequencies are used as the lower and upper frequency bounds in the grid, so they should be sub-sampled before
-    being passed into this function if fewer frequency bins are desired. The time bins are created by using the
-    footprint of the generalized morse wavelet at each scale as the width of the bin. The footprint is computed by
-    using the higher frequency bound of each frequency bin. The grid-element centers are computed from these bounds,
-    and the points are assigned the the grid-element centers that are nearest to them.
+    Divides the time-frequency plane of each epoch into a grid, so that each point described by the coordinates
+    (indices_time, f_hat) can later be assigned a grid-element label indicating which grid-element the point belongs
+    to. The given scale_frequencies are used as the lower and upper frequency bounds in the grid, so they should be
+    sub-sampled before being passed into this function if fewer frequency bins are desired. The time bins are
+    created by using the footprint of the generalized morse wavelet at each scale as the width of the bin. The
+    footprint is computed by using the higher frequency bound of each frequency bin.
     Args:
         ea_morse: An instance of ElementAnalysisMorse, used to compute the bins.
+        num_timepoints: The number of timepoints in the shape of the time-scale plane
         scale_frequencies: The scale_frequencies that define the bin edges along the scale axis
-        indices_time: The time coordinates of each point.
-        gf_hat: The frequency coordinates of each point (in radians).
-        batch_size: The number of points to assign simultaneously. This keeps the memory down.
 
     Returns:
         grid: A (num_grid_elements, 4) array giving the bounds of each bin as
             (lower_time, upper_time, lower_freq, upper_freq)
-        grid_assignments: A 1d array of grid labels between 0 and num_grid_elements which is the same length
-            as indices_time
     """
+
     # make sure these are in descending order
     scale_frequencies = scale_frequencies[np.argsort(-scale_frequencies)]
     footprint = ea_morse.analyzing_morse.footprint(scale_frequencies)
@@ -396,24 +394,43 @@ def assign_grid_labels(ea_morse, scale_frequencies, indices_time, f_hat, batch_s
         foot = footprint[i - 1]
         low_freq = scale_frequencies[i]
         high_freq = scale_frequencies[i - 1]
-        for j in range(foot, np.max(indices_time), foot):
+        for j in range(foot, num_timepoints + foot, foot):
             grid.append((j - foot, j, low_freq, high_freq))
-    grid = np.array(grid)
-    grid_centers = np.concatenate([
-        np.mean(grid[:, :2], axis=1, keepdims=True),
-        np.mean(grid[:, 2:], axis=1, keepdims=True)], axis=1)
-    if batch_size is None:
-        distances = cdist(
-            np.concatenate([np.expand_dims(indices_time, 1), np.expand_dims(f_hat, 1)], axis=1), grid_centers)
-        grid_assignments = np.argmin(distances, axis=1)
-    else:
-        grid_assignments = -1 * np.ones_like(indices_time)
-        for batch in range(0, len(indices_time), batch_size):
-            distances = cdist(
-                np.concatenate([np.expand_dims(indices_time[batch:(batch + batch_size)], 1),
-                                np.expand_dims(f_hat[batch:(batch + batch_size)], 1)], axis=1), grid_centers)
-            grid_assignments[batch:(batch + batch_size)] = np.argmin(distances, axis=1)
-    return grid, grid_assignments
+    return np.array(grid)
+
+
+def assign_grid_labels(grid, indices_time, f_hat):
+    """
+    Assigns to each point described by the coordinates (indices_time, f_hat) a grid-element label indicating which
+    grid-element the point belongs to, where grid is computed by make_grid. Points which have a higher frequency than
+    the upper bound on frequency in the bin with the maximum upper bound on frequency are assigned to the highest
+    frequency bin (at the same time interval). Similarly with points having a frequency below the lower bound of the
+    lowest frequency bin.
+    Args:
+        grid: A (num_grid_elements, 4) array giving the bounds of each bin as
+            (lower_time, upper_time, lower_freq, upper_freq). Typically computed by make_grid
+        indices_time: The time coordinates of each point.
+        f_hat: The frequency coordinates of each point (in radians).
+
+    Returns:
+        grid_assignments: A 1d array of grid labels between 0 and num_grid_elements which is the same length
+            as indices_time
+    """
+
+    grid_assignments = -1 * np.ones_like(indices_time)
+    max_upper_bound = np.max(grid[:, 3])
+    min_lower_bound = np.min(grid[:, 2])
+    for index_grid, grid_element in enumerate(grid):
+        indicator_element = np.logical_and(indices_time >= grid_element[0], indices_time < grid_element[1])
+        if grid_element[3] != max_upper_bound:  # no upper bound on frequency for the highest frequency
+            indicator_element = np.logical_and(indicator_element, f_hat < grid_element[3])
+        if grid_element[2] != min_lower_bound:  # no lower bound on frequency for the lowest frequency
+            indicator_element = np.logical_and(indicator_element, f_hat >= grid_element[2])
+        grid_assignments[indicator_element] = index_grid
+
+    assert (np.all(grid_assignments >= 0))
+
+    return grid_assignments
 
 
 def cumulative_indices_from_unique_inverse(inverse, counts):
@@ -503,6 +520,22 @@ def _numba_sum_min(x):
     return final_result
 
 
+def segment_median(segment_labels, *values):
+    unique_segment_labels, segment_labels, counts = np.unique(
+        segment_labels, axis=0, return_inverse=True, return_counts=True)
+    splits = np.cumsum(counts)[:-1]
+    indices_sort = np.argsort(segment_labels)
+    result = [unique_segment_labels, counts]
+    for v in values:
+        v = v[indices_sort]
+        for idx, item in enumerate(np.split(v, splits)):
+            m = median(item)
+            if idx == 0:
+                result.append(np.full(len(unique_segment_labels), np.nan, dtype=type(m)))
+            result[-1][idx] = m
+    return tuple(result)
+
+
 def segment_combine_events(segment_labels, c_hat, power_weighted_dict=None, unweighted_dict=None):
     """
     Combines events together according to segment_labels. The result will have 1 event per unique segment label
@@ -519,6 +552,7 @@ def segment_combine_events(segment_labels, c_hat, power_weighted_dict=None, unwe
 
     Returns:
         unique_segment_labels: An array of the unique segment labels
+        counts: The number of events in each unique segment
         modulus: The L2 norm of of the modulus of c_hat within label
         power_weighted_result: A dictionary having the same keys as power_weighted_dict, containing the
             weighted averages of each item from power_weighted_dict within label. Only returned if power_weighted_dict
@@ -526,7 +560,8 @@ def segment_combine_events(segment_labels, c_hat, power_weighted_dict=None, unwe
         unweighted_result: A dictionary having the same keys as unweighted_dict, containing the averages of each item
             from unweighted_dict within label. Only returned if unweighted_dict is not None
     """
-    unique_segment_labels, segment_labels = np.unique(segment_labels, axis=0, return_inverse=True)
+    unique_segment_labels, segment_labels, counts = np.unique(
+        segment_labels, axis=0, return_inverse=True, return_counts=True)
     indices_sort = np.argsort(segment_labels)
     segment_labels = segment_labels[indices_sort]
 
@@ -551,12 +586,12 @@ def segment_combine_events(segment_labels, c_hat, power_weighted_dict=None, unwe
             unweighted_result[k] = np.bincount(segment_labels, weights=unweighted_dict[k][indices_sort])
 
     if power_weighted_dict is not None and unweighted_dict is not None:
-        return unique_segment_labels, w, power_weighted_result, unweighted_result
+        return unique_segment_labels, counts, w, power_weighted_result, unweighted_result
     if power_weighted_dict is not None:
-        return unique_segment_labels, w, power_weighted_result
+        return unique_segment_labels, counts, w, power_weighted_result
     if unweighted_dict is not None:
-        return unique_segment_labels, w, unweighted_result
-    return unique_segment_labels, w
+        return unique_segment_labels, counts, w, unweighted_result
+    return unique_segment_labels, counts, w
 
 
 def common_label_count(vertices, labels, batch_size=100000):
@@ -619,9 +654,51 @@ def common_label_count(vertices, labels, batch_size=100000):
     return unique_vertices, unique_labels, joint_counts, independent_counts
 
 
-def source_cluster(source_affinity_matrix, n_clusters, sources, **spectral_kwargs):
-    from sklearn.cluster import SpectralClustering
-    spectral_clustering = SpectralClustering(n_clusters=n_clusters, affinity='precomputed', **spectral_kwargs)
-    source_clusters = spectral_clustering.fit_predict(source_affinity_matrix)
-    _, indices_vertices = np.unique(sources, return_inverse=True)
-    return source_clusters, source_clusters[indices_vertices]
+def k_pod(x, use_mini_batch=False, max_k_pod_iter=10, **k_means_kwargs):
+    """
+    Runs k-means clustering on data with missing values
+
+    Based on the algorithm from:
+    Chi, Jocelyn T., Eric C. Chi, and Richard G. Baraniuk.
+    "k-pod: A method for k-means clustering of missing data." The American Statistician 70, no. 1 (2016): 91-99.
+
+    Args:
+        x: The data to cluster (n_samples, n_features)
+        use_mini_batch: If True, MiniBatchKMeans is used internally instead of KMeans
+        max_k_pod_iter: The maximum number of outer-iterations of the algorithm
+        **k_means_kwargs: Arguments to sklearn.cluster.KMeans
+
+    Returns:
+        labels: The clusters for each sample. 1d array of length n_samples
+        cluster-centers: The cluster centers for each cluster
+        x: A copy of the input data with missing data replaced by cluster-center values
+    """
+    from sklearn.cluster import KMeans, MiniBatchKMeans
+
+    if max_k_pod_iter < 1:
+        raise ValueError('Need at least one iteration. max_k_pod_iter: {}'.format(max_k_pod_iter))
+
+    indicator_nan = np.isnan(x)
+    indicator_all_nan = np.all(indicator_nan, axis=0, keepdims=True)
+    x = np.where(indicator_all_nan, 0, x)
+    x = np.where(indicator_nan, np.nanmean(x, axis=0, keepdims=True), x)
+
+    previous_labels = None
+    k_means = None
+    for i in range(max_k_pod_iter):
+        k_means = MiniBatchKMeans(**k_means_kwargs) if use_mini_batch else KMeans(**k_means_kwargs)
+        labels = k_means.fit_predict(x)
+        # fill in the missing values based on their cluster centroids
+        x = np.where(indicator_nan, k_means.cluster_centers_[labels], x)
+
+        if previous_labels is not None and np.all(labels == previous_labels):
+            break
+
+        k_means_kwargs['init'] = k_means.cluster_centers_
+        k_means_kwargs['n_init'] = 1
+        previous_labels = labels
+
+    x = np.where(indicator_all_nan, np.nan, x)
+    cluster_centers = np.where(indicator_all_nan, np.nan, k_means.cluster_centers_)
+
+    return previous_labels, cluster_centers, x
