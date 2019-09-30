@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 
 from analytic_wavelet import ElementAnalysisMorse
 from analytic_wavelet_meg import radians_per_ms_from_hertz, PValueFilterFn, maxima_of_transform_mne_source_estimate, \
-    make_grid, assign_grid_labels, common_label_count, segment_combine_events, segment_median, k_pod
+    make_grid, assign_grid_labels, common_label_count, segment_combine_events, segment_median, k_pod, kendall_tau
 
 
 def load_harry_potter(subject, block):
@@ -230,6 +230,7 @@ def spectral_source_cluster(
         n_clusters=100,
         use_pointwise_mutual_information=True,
         use_median=False,
+        min_events=10,
         **spectral_kwargs):
     """
     Uses spectral clustering on an affinity matrix computed between each dipole and each other dipole.
@@ -246,6 +247,8 @@ def spectral_source_cluster(
             If use_median=False, the aggregated event magnitude is the L2 norm of the wavelet coefficients of each
                 event being aggregated. The other properties of the aggregated event are the power-weighted average
                 of each property of the events being aggregated.
+        min_events: If not None, then (cluster, epoch, grid-element) tuples containing less than this many events
+            will be dropped
         **spectral_kwargs: Additional arguments to sklearn.cluster.SpectralClustering
 
     Returns:
@@ -255,8 +258,10 @@ def spectral_source_cluster(
         clustering done on the other blocks.
 
         source_clusters: The cluster assignment for each source
-        magnitude: The L2 norm of the modulus of the events occurring within the same
+        magnitude: The L2 norm (or median if use_median=True) of the modulus of the events occurring within the same
             (block, stimulus, cluster, grid_element) tuple
+        magnitude_rms: The root-mean-squared value of the modulus of the events occurring within the same
+            (block, stimulus, cluster, grid_element) tuple. Only present if use_median=False
         f_hat: The power-weighted average of the estimated frequency events occurring within the same
             (block, stimulus, cluster, grid_element) tuple
         time: The power-weighted average of the time of the events occurring within the same
@@ -341,6 +346,7 @@ def spectral_source_cluster(
             np.expand_dims(sample_clusters, 1),
             np.expand_dims(grid_elements, 1)], axis=1)
 
+        rms_w_segment = None
         if use_median:
             (segments,
              segment_counts,
@@ -348,22 +354,22 @@ def spectral_source_cluster(
              f_hat_segment,
              time_segment,
              interpolated_scale_frequencies_segment) = segment_median(
-                segments, np.abs(c_hat), f_hat, indices_time, interp_fs)
+                segments, np.abs(c_hat), f_hat, indices_time, interp_fs, min_count=min_events)
             output_path = os.path.join(
                 element_analysis_dir,
                 'harry_potter_spectral_clustered_median_{subject}_hold_out_{hold_out}.npz'.format(
                     subject=subject, hold_out=hold_out_block))
         else:
-            segments, segment_counts, w_segment, power_weighted = segment_combine_events(
-                segments, c_hat, power_weighted_dict={'f_hat': f_hat, 'time': indices_time, 'interp_fs': interp_fs})
+            segments, segment_counts, w_segment, rms_w_segment, power_weighted = segment_combine_events(
+                segments, c_hat, min_count=min_events,
+                power_weighted_dict={'f_hat': f_hat, 'time': indices_time, 'interp_fs': interp_fs})
             f_hat_segment, time_segment, interpolated_scale_frequencies_segment = (
                 power_weighted['f_hat'], power_weighted['time'], power_weighted['interp_fs'])
             output_path = os.path.join(
                 element_analysis_dir, 'harry_potter_spectral_clustered_{subject}_hold_out_{hold_out}.npz'.format(
                     subject=subject, hold_out=hold_out_block))
 
-        np.savez(
-            output_path,
+        result_dict = dict(
             source_clusters=source_clusters,
             counts=segment_counts,
             magnitude=w_segment,
@@ -374,7 +380,13 @@ def spectral_source_cluster(
             blocks=segments[:, 1],
             sample_source_clusters=segments[:, 2],
             grid_elements=segments[:, 3],
-            grid=counts['grid'])
+            grid=counts['grid']
+        )
+
+        if rms_w_segment is not None:
+            result_dict['magnitude_rms'] = rms_w_segment
+
+        np.savez(output_path, **result_dict)
 
 
 def _insert_missing(block_stimuli, data, index):
@@ -408,7 +420,8 @@ def _rank_cluster_helper(
         maximum_proportion_missing,
         aggregation_mode,
         use_mini_batch,
-        k_pod_kwargs):
+        method,
+        method_kwargs):
 
     indicator_held_out = block_stimuli[:, 0] == held_out_block
 
@@ -426,7 +439,23 @@ def _rank_cluster_helper(
 
     train_array = nanrankdata(train_array, axis=1)
 
-    rank_clusters, centroids, _ = k_pod(train_array, use_mini_batch=use_mini_batch, **k_pod_kwargs)
+    if method == 'k_pod':
+        rank_clusters, centroids, _ = k_pod(train_array, use_mini_batch=use_mini_batch, **method_kwargs)
+    elif method == 'spectral':
+        from sklearn.cluster import SpectralClustering
+        train_array = nanrankdata(train_array, axis=1)
+        tau, num_common = kendall_tau(train_array)
+        affinity = (tau + 1) * num_common
+        spectral = SpectralClustering(affinity='precomputed', **method_kwargs)
+        rank_clusters = spectral.fit_predict(affinity)
+        np.savez('/share/volume0/drschwar/data_sets/harry_potter/element_analysis/rank_spectral_affinity.npz',
+                 affinity=affinity,
+                 tau=tau)
+        del affinity
+        centroids = None
+    else:
+        raise ValueError('Unknown method: {}'.format(method))
+
     unique_rank_clusters, inverse = np.unique(rank_clusters, return_inverse=True)
     assert (np.array_equal(unique_rank_clusters, np.arange(len(unique_rank_clusters))))
 
@@ -439,8 +468,15 @@ def _rank_cluster_helper(
     indices_element = indices_element[indicator_enough_data]
     result_data = np.full((dense_array.shape[1], len(unique_rank_clusters)), np.nan, dtype=dense_array.dtype)
     source_rank_clusters = np.full((len(source_clusters), len(grid)), -1, dtype=np.int32)
+
+    is_manual_centroids = centroids is None
+    if is_manual_centroids:
+        centroids = np.full((len(unique_rank_clusters),) + train_array.shape[1:], np.nan, dtype=train_array.dtype)
+
     for c in unique_rank_clusters:
         indicator_cluster = c == rank_clusters
+        if is_manual_centroids:
+            centroids[c] = nanmean(train_array[indicator_cluster], axis=0)
         if aggregation_mode == 'sum' or aggregation_mode == 'counts':
             result_data[:, c] = nansum(dense_array[indicator_cluster], axis=0)
         elif aggregation_mode == 'mean':
@@ -466,8 +502,7 @@ def _rank_cluster_helper(
         centroids)
 
 
-def _rank_cluster_only_combine_block(
-        element_analysis_dir, subject, block, grid, source_rank_clusters, mode):
+def rank_cluster_only_combine_block(element_analysis_dir, subject, block, grid, source_rank_clusters, aggregation):
     """
     Computes aggregate events for each (source, rank-cluster) tuple bypassing spectral cluster aggregation. This
     can be useful for comparing a predicted result to a ground-truth value at each dipole.
@@ -480,7 +515,7 @@ def _rank_cluster_only_combine_block(
         source_rank_clusters: A 2d array of shape (num_dipoles, num_grid_elements) giving the rank-cluster assignment
             for each (source, grid-element) tuple. Available in the rank-cluster file as
             'source_rank_clusters_<subject>_hold_out_<held-out-block>'
-        mode:
+        aggregation:
             If 'median', uses harry_potter_spectral_clustered_median_{subject}_hold_out_{hold_out}.npz as
                 input, thereby using the median absolute wavelet coefficient of the spectral clusters to rank
                 epochs when rank clustering. Also combines values from the spectral clusters using the median.
@@ -515,19 +550,23 @@ def _rank_cluster_only_combine_block(
         np.expand_dims(indices_source, 1),
         np.expand_dims(indices_cluster, 1)], axis=1)
 
-    dense_array = np.full((np.max(indices_stimuli) + 1,) + source_rank_clusters.shape, np.nan)
+    dense_array = np.full(
+        (np.max(indices_stimuli) + 1, np.max(indices_source) + 1, np.max(indices_cluster) + 1), np.nan)
 
-    if mode == 'counts':
+    if aggregation == 'counts':
         unique_segments, counts = np.unique(segments, axis=0, return_counts=True)
-        dense_array[unique_segments] = counts
-    elif mode == 'median':
+        dense_array[(
+            unique_segments[:, 0], unique_segments[:, 1], unique_segments[:, 2])] = counts
+    elif aggregation == 'median':
         unique_segments, _, w = segment_median(segments, np.abs(c_hat))
-        dense_array[unique_segments] = w
-    elif mode == 'L2':
+        dense_array[(
+            unique_segments[:, 0], unique_segments[:, 1], unique_segments[:, 2])] = w
+    elif aggregation == 'L2':
         unique_segments, _, w = segment_combine_events(segments, c_hat)
-        dense_array[unique_segments] = w
+        dense_array[(
+            unique_segments[:, 0], unique_segments[:, 1], unique_segments[:, 2])] = w
     else:
-        raise ValueError('Unrecognized mode: {}'.format(mode))
+        raise ValueError('Unrecognized mode: {}'.format(aggregation))
 
     return dense_array
 
@@ -535,9 +574,10 @@ def _rank_cluster_only_combine_block(
 def rank_cluster(
         element_analysis_dir,
         maximum_proportion_missing=0.1,
-        mode='L2',
+        aggregation='L2',
         n_multi_subject_clusters=None,
-        **k_pod_kwargs):
+        method='k_pod',
+        **method_kwargs):
     """
     Uses k-means clustering treating each (source-cluster, grid-element) tuple as a sample and the rank-order
     of the epochs as the features. (source-cluster, grid-element) tuples having more than maximum_proportion_missing
@@ -548,7 +588,7 @@ def rank_cluster(
             '/share/volume0/<your user name>/data_sets/harry_potter/element_analysis'
         maximum_proportion_missing: (source-cluster, grid-element) tuples having more than maximum_proportion_missing
             missing epochs will be dropped from the data instead of clustered.
-        mode:
+        aggregation:
             If 'median', uses harry_potter_spectral_clustered_median_{subject}_hold_out_{hold_out}.npz as
                 input, thereby using the median absolute wavelet coefficient of the spectral clusters to rank
                 epochs when rank clustering. Also combines values from the spectral clusters using the median.
@@ -561,7 +601,8 @@ def rank_cluster(
         n_multi_subject_clusters:
             If None, then the number of multi-subject clusters will be the same as the number of single-subject
             clusters. Set to 0 to turn off multi-subject clustering.
-        **k_pod_kwargs: Additional arguments to sklearn.cluster.SpectralClustering
+        method: What method to use for clustering. Either k_pod or spectral
+        **method_kwargs: Additional arguments to clustering method
 
     Returns:
         Saves a new file into element_analysis_dir with name harry_potter_rank_clustered.npz
@@ -586,7 +627,8 @@ def rank_cluster(
             (num_stimuli, n_clusters)
     """
     all_blocks = 1, 2, 3, 4
-    all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
+    # all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
+    all_subjects = 'A',
 
     # subject A has 2 '+' stimuli missing
     a_insert_indices = 1302, 2653
@@ -602,18 +644,18 @@ def rank_cluster(
         multi_subject_source_cluster_offset = 0
 
         for subject in tqdm(all_subjects, desc='subject', leave=False):
-            if mode == 'median' or mode == 'counts':
+            if aggregation == 'median' or aggregation == 'counts':
                 spectral_clustered_path = os.path.join(
                     element_analysis_dir,
                     'harry_potter_spectral_clustered_median_{subject}_hold_out_{block}.npz'.format(
                         subject=subject, block=held_out_block))
-            elif mode == 'L2':
+            elif aggregation == 'L2':
                 spectral_clustered_path = os.path.join(
                     element_analysis_dir,
                     'harry_potter_spectral_clustered_{subject}_hold_out_{block}.npz'.format(
                         subject=subject, block=held_out_block))
             else:
-                raise ValueError('Unrecognized mode: {}'.format(mode))
+                raise ValueError('Unrecognized mode: {}'.format(aggregation))
 
             spectral_clustered = np.load(spectral_clustered_path)
 
@@ -633,7 +675,7 @@ def rank_cluster(
             dense_array = np.full(
                 (np.max(sample_source_clusters) + 1, np.max(elements) + 1, np.max(virtual_stim) + 1), np.nan)
 
-            if mode == 'counts':
+            if aggregation == 'counts':
                 dense_array[(sample_source_clusters, elements, virtual_stim)] = counts
             else:
                 dense_array[(sample_source_clusters, elements, virtual_stim)] = w
@@ -654,7 +696,7 @@ def rank_cluster(
             result_data, stimuli, blocks, source_rank_clusters, spectral_rank_clusters, centroids = \
                 _rank_cluster_helper(
                     dense_array, block_stimuli, source_clusters, grid, held_out_block, maximum_proportion_missing,
-                    aggregation_mode=mode, use_mini_batch=False, k_pod_kwargs=k_pod_kwargs)
+                    aggregation_mode=aggregation, use_mini_batch=False, method=method, method_kwargs=method_kwargs)
             n_clusters = result_data.shape[1]
 
             if 'grid' in result:
@@ -673,8 +715,8 @@ def rank_cluster(
             result['data_{}_hold_out_{}'.format(subject, held_out_block)] = result_data
 
         if n_multi_subject_clusters != 0:
-            k_pod_kwargs_multi = dict(k_pod_kwargs)
-            k_pod_kwargs_multi['n_clusters'] = n_multi_subject_clusters \
+            method_kwargs_multi = dict(method_kwargs)
+            method_kwargs_multi['n_clusters'] = n_multi_subject_clusters \
                 if n_multi_subject_clusters is not None else n_clusters
 
             result_data, stimuli, blocks, source_rank_clusters, spectral_rank_clusters, centroids = \
@@ -684,9 +726,10 @@ def rank_cluster(
                     np.concatenate(multi_subject_source_clusters),
                     result['grid'],
                     held_out_block, maximum_proportion_missing,
-                    aggregation_mode=mode,
+                    aggregation_mode=aggregation,
                     use_mini_batch=False,
-                    k_pod_kwargs=k_pod_kwargs_multi)
+                    method=method,
+                    method_kwargs=method_kwargs_multi)
 
             assert np.array_equal(result['stimuli'], stimuli)
             assert np.array_equal(result['blocks'], blocks)
@@ -806,262 +849,9 @@ def rank_cluster(
                 each cluster when the subjects are clustered jointly. A 2d array with shape (num_stimuli, n_clusters). 
                 Note that this contains data for all blocks, but the clustering is fit without the held out block.
         """
-    if mode == 'counts':
-        np.savez(
-            os.path.join(element_analysis_dir, 'harry_potter_rank_clustered_counts.npz'),
-            **result)
-    elif mode == 'median':
-        np.savez(
-            os.path.join(element_analysis_dir, 'harry_potter_rank_clustered_median.npz'),
-            **result)
-    elif mode == 'L2':
-        np.savez(
-            os.path.join(element_analysis_dir, 'harry_potter_rank_clustered.npz'),
-            **result)
-    else:
-        raise ValueError('Unrecognized mode: {}'.format(mode))
 
+    output_name = 'harry_potter_rank_clustered{}{}.npz'.format(
+        '' if method == 'k_pod' else '_' + method,
+        '' if aggregation == 'L2' else '_' + aggregation)
 
-def source_rank_clustered_from_rank_clustered(element_analysis_dir, mode='L2'):
-    """
-    Computes aggregate events for each (source, rank-cluster) tuple bypassing spectral cluster aggregation, and makes
-    a new file which includes both this data and all of the data from the output of rank_cluster, but separated
-    into multiple files for each subject and held-out-block and since these files are big.
-    Useful for comparing a predicted result to a ground-truth value at each dipole.
-    Args:
-        element_analysis_dir: The directory where element analysis files can be found. For example:
-            '/share/volume0/<your user name>/data_sets/harry_potter/element_analysis'
-        mode:
-            If 'median', uses harry_potter_rank_clustered_median.npz as input, and aggregates events having the same
-                (epoch, source, rank-cluster) using the median of the absolute value of the wavelet coefficient for
-                those events
-            If 'counts', uses harry_potter_rank_clustered_median.npz as input, but uses the number of events in
-                each (epoch, source, rank-cluster) tuple as the representation for that tuple
-            If 'L2' (default), uses harry_potter_rank_clustered.npz as input, and aggregates events having the same
-                (epoch, source, rank-cluster) using the L2-norm of the absolute value of the wavelet coefficients of
-                those events.
-    Returns:
-        Saves a new file into element_analysis_dir with name similar to (depending on mode)
-            harry_potter_source_rank_clustered_<subject>_hold_out_<held-out-block>.npz
-
-        Fields:
-            description: Comments about what this data file contains.
-            grid: The boundaries of the grid elements. A 2d array with shape (num_grid_elements, 4) giving
-                (low-time, high-time, low-freq, high-freq) coordinates for each grid-element. The high-time
-                and high-freq boundaries are exclusive, the low-time and low-freq boundaries are inclusive.
-                Grid-elements at the lowest-frequency have an open-lower bound, meaning events which fall below
-                the lowest-frequency are put into the lowest frequency bins at the same time interval.
-                Similarly, events which occur at a higher frequency than the highest frequency bins are put
-                into the highest frequency bins at the same time interval.
-            stimuli: The text of the stimulus corresponding to each row of rank_clustered_data
-            blocks: The block corresponding to each row of rank_clustered_data
-            spectral_source_clusters: The spectral cluster assignment for each source (dipole).
-                A 1d array with shape (num_sources,)
-            source_rank_clusters: The rank-cluster assignment for each (source, grid-element) tuple.
-                A 2d array with shape (num_sources, num_grid_elements)
-            spectral_rank_clusters: The rank-cluster assignment for each (spectral_cluster, grid-element)
-                tuple. A 2d array with shape (num_spectral_clusters, num_grid_elements)
-            rank_cluster_centroids: The centroids for each rank-cluster.
-                A 2d array of shape (num_rank_clusters, num_train_epochs)
-            rank_clustered_data:
-                The L2 norm (or median when mode='median', or counts when mode='counts') of the input
-                magnitudes for each cluster. A 2d array with shape (num_stimuli, n_clusters). Note that
-                this contains data for all blocks, but the clustering is fit without the held out block.
-            source_rank_clustered_data:
-                The L2 norm (or median when mode='median', or counts when mode='counts') of the event
-                magnitudes for all events with (dipole, grid_element) coordinates that map to the same
-                (dipole, rank-cluster) coordinates. A 3d array with
-                shape (num_stimuli, num_dipoles, n_clusters). Note that this contains data for all blocks, but
-                the clustering is fit without the held out block.
-            source_rank_clusters_multi_subject: Similar to source_rank_clusters, but contains the cluster
-                assignments when all of the subjects are clustered jointly.
-            spectral_rank_clusters_multi_subject:
-                Similar to spectral_rank_clusters, but contains the cluster assignments when all of the
-                subjects are clustered jointly.
-            rank_cluster_centroids_multi_subject: The centroids for each rank-cluster when
-                all of the subjects are clustered jointly.
-            rank_clustered_data_multi_subject:
-                The L2 norm (or median, when mode='median', or counts when mode='counts') of the input
-                magnitudes for each cluster when the subjects are clustered jointly. A 2d array with shape
-                (num_stimuli, n_clusters). Note that this contains data for all blocks, but the clustering is
-                fit without the held out block.
-            source_rank_clustered_data_multi_subject:
-                The L2 norm (or median when mode='median', or counts when mode='counts') of the event
-                magnitudes for all events with (dipole, grid_element) coordinates that map to the same
-                (dipole, rank-cluster) coordinates when the subjects are clustered jointly. A 3d array with
-                shape (num_stimuli, num_dipoles, n_clusters). Note that this contains data for all blocks, but
-                the clustering is fit without the held out block.
-    """
-    if mode == 'counts':
-        rank_clustered = np.load(os.path.join(element_analysis_dir, 'harry_potter_rank_clustered_counts.npz'))
-    elif mode == 'median':
-        rank_clustered = np.load(os.path.join(element_analysis_dir, 'harry_potter_rank_clustered_median.npz'))
-    elif mode == 'L2':
-        rank_clustered = np.load(os.path.join(element_analysis_dir, 'harry_potter_rank_clustered.npz'))
-    else:
-        raise ValueError('Unrecognized mode: {}'.format(mode))
-
-    blocks = np.unique(rank_clustered['blocks'])
-    for held_out_block in tqdm(blocks, desc='hold_out_block'):
-        for subject in tqdm(rank_clustered['subjects'], desc='subject', leave=False):
-            result = {
-                'grid': rank_clustered['grid'],
-                'stimuli': rank_clustered['stimuli'],
-                'blocks': rank_clustered['blocks'],
-                'spectral_source_clusters': rank_clustered[
-                    'spectral_source_clusters_{}_hold_out_{}'.format(subject, held_out_block)],
-                'source_rank_clusters': rank_clustered[
-                    'source_rank_clusters_{}_hold_out_{}'.format(subject, held_out_block)],
-                'spectral_rank_clusters': rank_clustered[
-                    'spectral_rank_clusters_{}_hold_out_{}'.format(subject, held_out_block)],
-                'rank_cluster_centroids': rank_clustered[
-                    'rank_cluster_centroids_{}_hold_out_{}'.format(subject, held_out_block)],
-                'rank_clustered_data': rank_clustered[
-                    'data_{}_hold_out_{}'.format(subject, held_out_block)],
-                'source_rank_clusters_multi_subject': rank_clustered[
-                    'source_rank_clusters_multi_subject_{}_hold_out_{}'.format(subject, held_out_block)],
-                'spectral_rank_clusters_multi_subject': rank_clustered[
-                    'spectral_rank_clusters_multi_subject_{}_hold_out_{}'.format(subject, held_out_block)],
-                'rank_clustered_data_multi_subject': rank_clustered[
-                    'data_multi_subject_{}_hold_out_{}'.format(subject, held_out_block)]
-            }
-            for is_multi in (False, True):
-                if is_multi:
-                    source_rank_clusters = rank_clustered[
-                        'source_rank_clusters_multi_subject_{}_hold_out_{}'.format(subject, held_out_block)]
-                else:
-                    source_rank_clusters = rank_clustered[
-                        'source_rank_clusters_{}_hold_out_{}'.format(subject, held_out_block)]
-
-                combined_events = list()
-                for block in blocks:
-                    combined_events.append(_rank_cluster_only_combine_block(
-                        element_analysis_dir, subject, block, rank_clustered['grid'], source_rank_clusters, mode))
-                combined_events = np.concatenate(combined_events)
-
-                # subject A is missing a couple of fixation crosses at the end of blocks 1 and 2
-                if subject == 'A':
-                    for idx in 1302, 2653:
-                        assert (result['stimuli'][idx]) == '+'
-                        combined_events = np.concatenate([
-                            combined_events[:idx],
-                            np.full((1,) + combined_events.shape[1:], np.nan, dtype=combined_events.dtype),
-                            combined_events[idx:]], axis=0)
-
-                assert(len(combined_events) == len(result['stimuli']))
-
-                if is_multi:
-                    result['source_rank_clustered_data_multi_subject'] = combined_events
-                else:
-                    result['source_rank_clustered_data'] = combined_events
-
-            result['description'] = \
-                """
-                This data file contains the result of clustering MEG data using a 4-step process, with an additional
-                5th step applied after.:
-                1. Data is source-localized using minimum norm estimation
-                2. An analytic wavelet transform is run on each dipole, and element analysis (Lilly, 2017) is applied. 
-                    Roughly speaking, this extracts local maxima from the wavelet transformed data.
-                3. Each epoch (i.e. 500 ms of time corresponding to a word) is subdivided into a grid based on 
-                    log-spaced frequencies and time-windows which vary with the footprint of the analyzing wavelet. 
-                    Pointwise-mutual information is computed between each pair of dipoles. The number of maxima within 
-                    a grid cell for a given dipole and epoch is used as a count for each individual dipole, and the 
-                    joint count is the minimum of the individual count for each pair of dipoles. Summing over all 
-                    epochs and grid-elements gives the final joint and individual counts from which PMI is computed. 
-                    Spectral clustering is applied to the PMI matrix to cluster the dipoles. This can roughly be 
-                    thought of as clustering the dipoles according to phase-locking value, i.e. this is an 
-                    approximation to clustering by functional connectivity. The events (maxima) within a dipole 
-                    cluster are then combined together within each grid-cell, epoch tuple. When multiple events occur 
-                    within the same grid-cell, they are aggregated according to one of three rules.
-                        In harry_potter_rank_clustered.npz the magnitude is computed as the L2-norm of the events,
-                            and other properties of the events are combined using the power-weighted average.
-                        In harry_potter_rank_clustered_median.npz the properties of the aggregate events are the medians
-                            of each property
-                        In harry_potter_rank_clustered_counts.npz the number of events comprising each cluster is used
-                            to represent each cluster
-                4. A matrix is formed which has on one axis each dipole-cluster, grid-cell tuple, and on the other 
-                    axis each epoch. The epochs are ranked within a dipole-cluster, and k-means is applied using as 
-                    the samples the (dipole-cluster, grid-cell) axis and as feature the epoch ranking (actually a
-                    variant of k-means which can handle missing data). This gives a new clustering, which groups 
-                    together similar (dipole-cluster, grid-cell) tuples where similarity is defined as their ranking 
-                    of the epochs. We call these rank-clusters. Events occurring within the same rank cluster are 
-                    again aggregated together. For each epoch (word) using the same aggregation as described in step 3, 
-                    this gives us num_rank_cluster values as the final data.
-                5. After this clustering process has completed, the raw events are aggregated according to the mapping
-                    from a (dipole, grid_element) tuple to a rank-cluster. That is, we take the dipole, grid_element
-                    coordinates of each event, compute the rank-cluster from this, and then output aggregate events for
-                    each (dipole, rank-cluster) tuple. That gives a kind of ground-truth number for each rank-cluster
-                    at each dipole that can be compared to predictions for each rank-cluster.
-
-                The code which produces this data can be found at 
-                https://github.com/danrsc/analytic_wavelet_meg and https://github.com/danrsc/analytic_wavelet
-
-                Note that all fields in this file contain information for one subject where the values were computed 
-                with the appropriate block held out of all training steps (the PMI is computed without this block 
-                for the spectral clustering, and the k-means is computed without this block for the rank clustering).
-
-                Fields:
-                    description: Comments about what this data file contains.
-                    grid: The boundaries of the grid elements. A 2d array with shape (num_grid_elements, 4) giving 
-                        (low-time, high-time, low-freq, high-freq) coordinates for each grid-element. The high-time 
-                        and high-freq boundaries are exclusive, the low-time and low-freq boundaries are inclusive. 
-                        Grid-elements at the lowest-frequency have an open-lower bound, meaning events which fall below 
-                        the lowest-frequency are put into the lowest frequency bins at the same time interval. 
-                        Similarly, events which occur at a higher frequency than the highest frequency bins are put 
-                        into the highest frequency bins at the same time interval.
-                    stimuli: The text of the stimulus corresponding to each row of rank_clustered_data
-                    blocks: The block corresponding to each row of rank_clustered_data
-                    spectral_source_clusters: The spectral cluster assignment for each source (dipole).
-                        A 1d array with shape (num_sources,)
-                    source_rank_clusters: The rank-cluster assignment for each (source, grid-element) tuple. 
-                        A 2d array with shape (num_sources, num_grid_elements)
-                    spectral_rank_clusters: The rank-cluster assignment for each (spectral_cluster, grid-element) 
-                        tuple. A 2d array with shape (num_spectral_clusters, num_grid_elements)
-                    rank_cluster_centroids: The centroids for each rank-cluster.
-                        A 2d array of shape (num_rank_clusters, num_train_epochs)
-                    rank_clustered_data:
-                        The L2 norm (or median when mode='median', or counts when mode='counts') of the input 
-                        magnitudes for each cluster. A 2d array with shape (num_stimuli, n_clusters). Note that 
-                        this contains data for all blocks, but the clustering is fit without the held out block.
-                    source_rank_clustered_data:
-                        The L2 norm (or median when mode='median', or counts when mode='counts') of the event
-                        magnitudes for all events with (dipole, grid_element) coordinates that map to the same
-                        (dipole, rank-cluster) coordinates. A 3d array with 
-                        shape (num_stimuli, num_dipoles, n_clusters). Note that this contains data for all blocks, but
-                        the clustering is fit without the held out block.
-                    source_rank_clusters_multi_subject: Similar to source_rank_clusters, but contains the cluster 
-                        assignments when all of the subjects are clustered jointly.
-                    spectral_rank_clusters_multi_subject: 
-                        Similar to spectral_rank_clusters, but contains the cluster assignments when all of the 
-                        subjects are clustered jointly.
-                    rank_cluster_centroids_multi_subject: The centroids for each rank-cluster when
-                        all of the subjects are clustered jointly.
-                    rank_clustered_data_multi_subject: 
-                        The L2 norm (or median, when mode='median', or counts when mode='counts') of the input 
-                        magnitudes for each cluster when the subjects are clustered jointly. A 2d array with shape 
-                        (num_stimuli, n_clusters). Note that this contains data for all blocks, but the clustering is 
-                        fit without the held out block.
-                    source_rank_clustered_data_multi_subject:
-                        The L2 norm (or median when mode='median', or counts when mode='counts') of the event
-                        magnitudes for all events with (dipole, grid_element) coordinates that map to the same
-                        (dipole, rank-cluster) coordinates when the subjects are clustered jointly. A 3d array with 
-                        shape (num_stimuli, num_dipoles, n_clusters). Note that this contains data for all blocks, but
-                        the clustering is fit without the held out block.
-                """
-            if mode == 'counts':
-                np.savez(os.path.join(
-                        element_analysis_dir,
-                        'harry_potter_source_rank_clustered_counts_{}_hold_out_{}.npz'.format(subject, held_out_block)),
-                    **result)
-            elif mode == 'median':
-                np.savez(os.path.join(
-                        element_analysis_dir,
-                        'harry_potter_source_rank_clustered_median_{}_hold_out_{}.npz'.format(subject, held_out_block)),
-                    **result)
-            elif mode == 'L2':
-                np.savez(os.path.join(
-                        element_analysis_dir,
-                        'harry_potter_source_rank_clustered_{}_hold_out_{}.npz'.format(subject, held_out_block)),
-                    **result)
-            else:
-                raise ValueError('Unrecognized mode: {}'.format(mode))
+    np.savez(os.path.join(element_analysis_dir, output_name), **result)
