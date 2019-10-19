@@ -496,7 +496,7 @@ def _parallel_quantile(v, q, bounds):
         if q is None:
             m[i] = np.median(v[bounds[i][0]:bounds[i][1]])
         else:
-            m[i] = np.quantile(v[bounds[i][0]:bounds[i][1]])
+            m[i] = np.quantile(v[bounds[i][0]:bounds[i][1]], q)
     return m
 
 
