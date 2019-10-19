@@ -1,7 +1,7 @@
 import os
 import gc
-from datetime import datetime
 import numpy as np
+from sklearn.cluster import SpectralClustering
 from bottleneck import nanrankdata, nanmedian, nansum, nanmean
 import mne
 
@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 
 from analytic_wavelet import ElementAnalysisMorse
 from analytic_wavelet_meg import radians_per_ms_from_hertz, PValueFilterFn, maxima_of_transform_mne_source_estimate, \
-    make_grid, assign_grid_labels, common_label_count, segment_combine_events, segment_median, k_pod, kendall_tau
+    make_grid, assign_grid_labels, common_label_count, segment_combine_events, segment_median, kendall_tau
 
 
 def load_harry_potter(subject, block):
@@ -103,33 +103,72 @@ def make_element_analysis_block(output_path, load_fn, subject, block, label_name
         right_vertices=vertices[1])
 
 
-def _compute_shared_grid_element_counts(ea_path):
-    ea_block = np.load(ea_path)
+def _compute_shared_grid_element_counts(ea_path, time_slice_ms=None, weight_kind=None):
+    with np.load(ea_path) as ea_block:
+        ea_morse = ElementAnalysisMorse(ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
+        c_hat, _, f_hat = ea_morse.event_parameters(
+            ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
 
-    ea_morse = ElementAnalysisMorse(ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
-    c_hat, _, f_hat = ea_morse.event_parameters(
-        ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
+        scale_frequencies = ea_block['scale_frequencies']
 
-    scale_frequencies = ea_block['scale_frequencies']
+        indices_stimuli, indices_source, _, indices_time = np.unravel_index(
+            ea_block['indices_flat'], ea_block['shape'])
 
-    indices_stimuli, indices_source, _, indices_time = np.unravel_index(
-        ea_block['indices_flat'], ea_block['shape'])
+        has_slices = True
+        if time_slice_ms is None:
+            has_slices = False
+            time_slice_ms = ea_block['shape'][-1]
 
-    # noinspection PyTypeChecker
-    grid = make_grid(ea_morse, ea_block['shape'][-1], scale_frequencies[np.arange(0, len(scale_frequencies), 10)])
-    grid_labels = assign_grid_labels(grid, indices_time, f_hat)
+        if ea_block['shape'][-1] // time_slice_ms * time_slice_ms != ea_block['shape'][-1]:
+            raise ValueError('time_slice_ms must divide epochs exactly. Epoch has {} ms, time_slice_ms is {}'.format(
+                ea_block['shape'][-1], time_slice_ms))
 
-    # flatten this index to save some memory
-    combine_source_labels = np.ravel_multi_index(
-        (indices_stimuli, grid_labels), (ea_block['shape'][0], len(grid)))
+        # noinspection PyTypeChecker
+        grid = make_grid(ea_morse, time_slice_ms, scale_frequencies[np.arange(0, len(scale_frequencies), 10)])
 
-    del indices_stimuli
+        num_slices = ea_block['shape'][-1] // time_slice_ms
 
-    unique_sources, _, joint_count, independent_count = common_label_count(indices_source, combine_source_labels)
-    return unique_sources, joint_count, independent_count, grid, grid_labels
+        joint_count = list()
+        independent_count = list()
+        grid_labels = list()
+
+        for index_slice in range(num_slices):
+            indices_time_slice = indices_time - index_slice * time_slice_ms
+            indicator_slice = np.logical_and(indices_time_slice >= 0, indices_time_slice < time_slice_ms)
+            slice_grid_labels = assign_grid_labels(grid, indices_time_slice[indicator_slice], f_hat[indicator_slice])
+
+            # flatten this index to save some memory
+            combine_source_labels = np.ravel_multi_index(
+                (indices_stimuli[indicator_slice], slice_grid_labels), (ea_block['shape'][0], len(grid)))
+
+            weights = None
+            if weight_kind == 'power':
+                weights = np.square(np.abs(c_hat[indicator_slice]))
+            elif weight_kind == 'amplitude':
+                weights = np.abs(c_hat[indicator_slice])
+            elif weight_kind is not None:
+                raise ValueError('Unknown weight_kind: {}'.format(weight_kind))
+
+            slice_joint_count, slice_independent_count = common_label_count(
+                indices_source[indicator_slice], combine_source_labels, weights=weights)
+
+            joint_count.append(slice_joint_count)
+            independent_count.append(slice_independent_count)
+            grid_labels.append(slice_grid_labels)
+
+        if has_slices:
+            joint_count = np.array(joint_count)
+            independent_count = np.array(independent_count)
+            grid_labels = np.concatenate(grid_labels)
+        else:
+            joint_count = joint_count[0]
+            independent_count = independent_count[0]
+            grid_labels = grid_labels[0]
+
+    return joint_count, independent_count, grid, grid_labels
 
 
-def compute_shared_grid_element_counts(element_analysis_dir, subjects=None, label_name=None):
+def compute_shared_grid_element_counts(element_analysis_dir, subject, time_slice_ms=None, weight_kind=None):
     """
     Computes how often two dipoles have events in the same 'grid element'. A grid element divides
     the time-scale plane into boxes that are log-scaled on the scale axis and scaled according to the
@@ -145,95 +184,106 @@ def compute_shared_grid_element_counts(element_analysis_dir, subjects=None, labe
     Args:
         element_analysis_dir: The directory where element analysis files can be found. For example:
             '/share/volume0/<your user name>/data_sets/harry_potter/element_analysis'
-        subjects: Which subjects to run the counts on. Defaults to all subjects.
-        label_name: If specified, analysis is restricted to a single FreeSurfer label
-
+        subject: Which subject to run the counts on.
+        time_slice_ms: If provided, counts are computed within slices of the time spanning this many ms
+        weight_kind: 
+            If 'power' counts are weighted by the square of the modulus of the wavelet coefficient
+            If 'amplitude' counts are weighted by the modulus of the wavelet coefficient
+            If None (default), counts are not weighted
     Returns:
         None. Saves an output file for each subject, containing, for each block, the keys:
             sources_<block>: The unique sources for the block, in the order of the grid element counts. As long
                 as the element analysis has been run in a consistent way, these should be the same across all blocks.
             source_shared_grid_element_count_<block>: The (num_vertices, num_vertices) matrix of counts giving how
-                often two vertices have events in the same grid-element. The events must occur in the grid element
+                often two vertices have events in the same grid-cell. The events must occur in the grid element
                 within the same epoch in order to be counted as being shared. The count for a grid element within an
                 epoch is the minimum of the count of events from vertex 1 and vertex 2 within that element in that
                 epoch
             grid_<block>: A (num_grid_elements, 4) array giving the bounding boxes for each grid element as:
-                (time_lower, time_upper, freq_lower, freq_upper). Note that grid-element assignments are done by
+                (time_lower, time_upper, freq_lower, freq_upper). Note that grid-cell assignments are done by
                 nearest-neighbor to the center point of each grid element. As long as element analysis has been run
                 in a consistent way, these should be the same across all blocks.
             grid_elements_<block>: A 1d array of the labels of which grid element each event is assigned to.
         The output also contains the key "blocks", which gives the list of blocks in the output.
     """
 
-    all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
     all_blocks = '1', '2', '3', '4'
 
-    if subjects is None:
-        subjects = all_subjects
+    result = {'blocks': all_blocks}
+    subject_joint_shape = None
+    subject_grid = None
+    for block in tqdm(all_blocks):
+        ea_path = os.path.join(
+            element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
+        joint_counts, independent_counts, grid, grid_labels = _compute_shared_grid_element_counts(
+            ea_path, time_slice_ms, weight_kind=weight_kind)
 
-    for s in subjects:
-        if s not in all_subjects:
-            raise ValueError('Unknown subject: {}'.format(s))
+        # try to release some memory
+        gc.collect()
 
-    # this takes about 1 hour per block
-    for subject in tqdm(subjects):
+        if subject_joint_shape is None:
+            subject_joint_shape = joint_counts.shape
+            subject_grid = grid
+            result['grid'] = grid
+        else:
+            assert(np.array_equal(subject_joint_shape, joint_counts.shape))
+            assert(np.array_equal(subject_grid, grid))
 
-        tqdm.write('Beginning analysis for subject {} at {}'.format(subject, datetime.now()))
+        result['joint_grid_element_count_{}'.format(block)] = joint_counts
+        result['independent_grid_element_count_{}'.format(block)] = independent_counts
+        result['grid_elements_{}'.format(block)] = grid_labels
 
-        result = {'blocks': all_blocks}
-        subject_sources = None
-        subject_grid = None
-        for block in tqdm(all_blocks, leave=False):
-            if label_name is not None:
-                ea_path = os.path.join(
-                    element_analysis_dir,
-                    'harry_potter_element_analysis_{}_{}_{}.npz'.format(subject, block, label_name))
-            else:
-                ea_path = os.path.join(element_analysis_dir,
-                                       'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
-            unique_sources, joint_counts, independent_counts, grid, grid_labels = \
-                _compute_shared_grid_element_counts(ea_path)
-
-            # try to release some memory
-            gc.collect()
-
-            if subject_sources is None:
-                subject_sources = unique_sources
-                subject_grid = grid
-                result['sources'] = unique_sources
-                result['grid'] = grid
-            else:
-                assert(np.array_equal(subject_sources, unique_sources))
-                assert(np.array_equal(subject_grid, grid))
-
-            result['joint_grid_element_count_{}'.format(block)] = joint_counts
-            result['independent_grid_element_count_{}'.format(block)] = independent_counts
-            result['grid_elements_{}'.format(block)] = grid_labels
-
-            # get rid of these references so we can free up memory after we write result (i.e. on the last block)
-            del unique_sources
-            del joint_counts
-            del independent_counts
-            del grid
-            del grid_labels
-
+    if time_slice_ms is not None:
+        output_file_name = 'harry_potter_shared_grid_element_counts_{subject}_time_slice_ms_{time_slice_ms}.npz'
+    else:
         output_file_name = 'harry_potter_shared_grid_element_counts_{subject}.npz'
-        if label_name is not None:
-            output_file_name = 'harry_potter_shared_grid_element_counts_{subject}_{label}.npz'
-        np.savez(
-            os.path.join(element_analysis_dir, output_file_name.format(subject=subject, label=label_name)), **result)
+    np.savez(
+        os.path.join(element_analysis_dir, output_file_name.format(
+            subject=subject, time_slice_ms=time_slice_ms)), **result)
 
 
-def spectral_source_cluster(
+def _renumber_clusters(clusters_in_dipole_order, previous_clusters=None):
+    if previous_clusters is not None:
+        # use overlap to keep consistency across slices
+        from scipy.optimize import linear_sum_assignment
+        if not np.array_equal(clusters_in_dipole_order.shape, previous_clusters.shape):
+            raise ValueError('previous_clusters must have the same shape as clusters_in_dipole_order')
+        overlap = np.zeros((np.max(clusters_in_dipole_order) + 1, np.max(previous_clusters) + 1), np.intp)
+        if overlap.shape[0] != overlap.shape[1]:
+            raise ValueError('clusters_in_dipole_order and previous_clusters must have the same range')
+        pair_indices, overlap_ = np.unique(
+            np.ravel_multi_index((
+                np.reshape(clusters_in_dipole_order, -1), np.reshape(previous_clusters, -1)), overlap.shape),
+            return_counts=True)
+        overlap[np.unravel_index(pair_indices, overlap.shape)] = overlap_
+        _, new_numbers = linear_sum_assignment(np.max(overlap) - overlap)
+        return new_numbers[clusters_in_dipole_order]
+    else:
+        # use dipole order to try to keep consistency across runs
+        indices_sort = np.argsort(clusters_in_dipole_order)
+        cluster_cum_count = np.cumsum(np.bincount(clusters_in_dipole_order))
+        median_ranks = list()
+        for i in range(len(cluster_cum_count)):
+            start = 0 if i == 0 else cluster_cum_count[i - 1]
+            median_ranks.append(np.median(indices_sort[start:cluster_cum_count[i]]))
+        new_numbers = np.argsort(np.array(median_ranks))
+        return new_numbers[clusters_in_dipole_order]
+
+
+def co_occurrence_source_cluster(
         element_analysis_dir,
         subject,
         n_clusters=100,
         use_pointwise_mutual_information=True,
-        use_median=False,
+        aggregation='power',
         min_events=10,
+        time_slice_ms=None,
+        ignore_grid_on_aggregate=False,
+        knn=None,
         **spectral_kwargs):
     """
-    Uses spectral clustering on an affinity matrix computed between each dipole and each other dipole.
+    Uses spectral clustering on an affinity matrix computed between each dipole and each other dipole, where the
+    affinity matrix is based on co-occurrence of events from element-analysis.
     Args:
         element_analysis_dir: The directory where element analysis files can be found. For example:
             '/share/volume0/<your user name>/data_sets/harry_potter/element_analysis'
@@ -241,27 +291,51 @@ def spectral_source_cluster(
         n_clusters: The number of clusters to produce
         use_pointwise_mutual_information: If True normalizes joint counts by the product of the independent counts,
             otherwise no normalization is done
-        use_median: Events in the same cluster, epoch, and grid-element are aggregated together by this method.
-            If use_median=True, the aggregated event properties are the medians over the events being aggregated
-                of each property
-            If use_median=False, the aggregated event magnitude is the L2 norm of the wavelet coefficients of each
+        aggregation: One of 'power' (default), 'amplitude', 'median'
+            Events in the same cluster, epoch, and grid-element are aggregated together by this method.
+            If 'power', the aggregated event magnitude is the L2 norm of the wavelet coefficients of each
                 event being aggregated. The other properties of the aggregated event are the power-weighted average
-                of each property of the events being aggregated.
+                of each property of the events being aggregated. The root-mean-squared wavelet coefficient is also
+                computed and stored
+            If 'amplitude', the aggregated event magnitude is the sum of the absolute wavelet coefficients of each
+                event being aggregated. The other properties of the aggregated event are the absolute-coefficient
+                weighted average of each property of the events being aggregated. The mean absolute wavelet coefficient
+                is also computed and stored
+            If 'median', the aggregated event properties are the medians over the events being aggregated
+                of each property, and the aggregated event magnitude is the median absolute wavelet coefficient
         min_events: If not None, then (cluster, epoch, grid-element) tuples containing less than this many events
             will be dropped
+        time_slice_ms: If provided, clusters are computed within slices of the time spanning this many ms. Must have
+            run compute_shared_grid_element_counts with this value of time_slice_ms before running this step.
+        ignore_grid_on_aggregate: If True, then aggregation occurs within (cluster, epoch), completely ignoring
+            grid_element after clustering has occurred. Typically this would be used in combination with time_slice_ms
+            so that the aggregation is within a time-slice instead of within a grid-element.
+        knn: If set, this number of nearest-neighbors is used to build the affinity matrix rather than using the
+            fully connected graph
         **spectral_kwargs: Additional arguments to sklearn.cluster.SpectralClustering
 
     Returns:
         Saves a new file into element_analysis_dir for each held-out block with name
-        harry_potter_spectral_clustered_{subject}_hold_out_{hold_out}.npz
+        harry_potter_co_occurrence_clustered_{aggregation}_{subject}_hold_out_{hold_out}.npz
         Note that each hold-out file has data for all of the blocks, with the held out block mapped according to the
         clustering done on the other blocks.
 
         source_clusters: The cluster assignment for each source
-        magnitude: The L2 norm (or median if use_median=True) of the modulus of the events occurring within the same
-            (block, stimulus, cluster, grid_element) tuple
-        magnitude_rms: The root-mean-squared value of the modulus of the events occurring within the same
-            (block, stimulus, cluster, grid_element) tuple. Only present if use_median=False
+        magnitude:
+            If aggregation == 'power', the L2 norm of the modulus of the events occurring within the same
+                (block, stimulus, cluster, grid_element) tuple
+            If aggregation == 'amplitude', the L1 norm of the modulus of the events occurring within the same
+                (block, stimulus, cluster, grid_element) tuple
+            If aggregation == 'median', the median of the modulus of the events occurring within the same
+                (block, stimulus, cluster, grid_element) tuple
+            If aggregation == 'percentile_75', the 75th percentile of the modulus of the events occurring within
+                the same (block, stimulus, cluster, grid_element) tuple
+        magnitude_mean:
+            If aggregation == 'power', the root-mean-squared value of the modulus of the events occurring within
+                the same (block, stimulus, cluster, grid_element) tuple
+            If aggregation == 'amplitude', the mean absolute value of the modulus of the events occurring within the
+                same (block, stimulus, cluster, grid_element) tuple
+            If aggregation == 'median', not present
         f_hat: The power-weighted average of the estimated frequency events occurring within the same
             (block, stimulus, cluster, grid_element) tuple
         time: The power-weighted average of the time of the events occurring within the same
@@ -273,8 +347,6 @@ def spectral_source_cluster(
         sample_source_clusters: The cluster corresponding to each event average
         grid_elements: The grid-element corresponding to each event average
     """
-    from sklearn.cluster import SpectralClustering
-
     all_blocks = 1, 2, 3, 4
 
     indices_stimuli = list()
@@ -287,22 +359,20 @@ def spectral_source_cluster(
     for block in all_blocks:
         ea_path = os.path.join(
             element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
-        ea_block = np.load(ea_path)
+        with np.load(ea_path) as ea_block:
+            indices_stimuli_block, indices_source_block, _, indices_time_block = np.unravel_index(
+                ea_block['indices_flat'], ea_block['shape'])
+            indices_stimuli.append(indices_stimuli_block)
+            indices_block.append(np.array([block] * len(indices_stimuli_block), dtype=indices_stimuli_block.dtype))
+            indices_source.append(indices_source_block)
+            indices_time.append(indices_time_block)
 
-        indices_stimuli_block, indices_source_block, _, indices_time_block = np.unravel_index(
-            ea_block['indices_flat'], ea_block['shape'])
-        indices_stimuli.append(indices_stimuli_block)
-        indices_block.append(np.array([block] * len(indices_stimuli_block), dtype=indices_stimuli_block.dtype))
-        indices_source.append(indices_source_block)
-        indices_time.append(indices_time_block)
-
-        interp_fs.append(ea_block['interpolated_scale_frequencies'])
-        ea_morse = ElementAnalysisMorse(ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
-        c_hat_block, _, f_hat_block = ea_morse.event_parameters(
-            ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
-        c_hat.append(c_hat_block)
-        f_hat.append(f_hat_block)
-        del ea_block
+            interp_fs.append(ea_block['interpolated_scale_frequencies'])
+            ea_morse = ElementAnalysisMorse(ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
+            c_hat_block, _, f_hat_block = ea_morse.event_parameters(
+                ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
+            c_hat.append(c_hat_block)
+            f_hat.append(f_hat_block)
 
     indices_stimuli = np.concatenate(indices_stimuli)
     indices_block = np.concatenate(indices_block)
@@ -312,81 +382,132 @@ def spectral_source_cluster(
     c_hat = np.concatenate(c_hat)
     f_hat = np.concatenate(f_hat)
 
-    count_path = os.path.join(
-        element_analysis_dir, 'harry_potter_shared_grid_element_counts_{subject}.npz'.format(subject=subject))
-    counts = np.load(count_path)
+    if time_slice_ms is not None:
+        count_path = os.path.join(
+            element_analysis_dir,
+            'harry_potter_shared_grid_element_counts_{subject}_time_slice_ms_{time_slice_ms}.npz'.format(
+                subject=subject, time_slice_ms=time_slice_ms))
+    else:
+        count_path = os.path.join(
+            element_analysis_dir, 'harry_potter_shared_grid_element_counts_{subject}.npz'.format(subject=subject))
+    with np.load(count_path) as counts:
 
-    grid_elements = np.concatenate(list(counts['grid_elements_{}'.format(b)] for b in all_blocks))
+        grid_elements = np.concatenate(list(counts['grid_elements_{}'.format(b)] for b in all_blocks))
 
-    for hold_out_block in tqdm(all_blocks):
-        train_blocks = [b for b in all_blocks if b != hold_out_block]
-        joint_counts = None
-        independent_counts = None
-        for block in train_blocks:
-            if joint_counts is None:
-                joint_counts = counts['joint_grid_element_count_{}'.format(block)]
-                if use_pointwise_mutual_information:
-                    independent_counts = counts['independent_grid_element_count_{}'.format(block)]
+        for hold_out_block in tqdm(all_blocks):
+            train_blocks = [b for b in all_blocks if b != hold_out_block]
+            joint_counts = None
+            independent_counts = None
+            for block in train_blocks:
+                if joint_counts is None:
+                    joint_counts = counts['joint_grid_element_count_{}'.format(block)]
+                    if use_pointwise_mutual_information:
+                        independent_counts = counts['independent_grid_element_count_{}'.format(block)]
+                else:
+                    joint_counts += counts['joint_grid_element_count_{}'.format(block)]
+                    if use_pointwise_mutual_information:
+                        independent_counts += counts['independent_grid_element_count_{}'.format(block)]
+
+            if use_pointwise_mutual_information:
+                if time_slice_ms is not None:
+                    independent_counts = np.expand_dims(independent_counts, 2) * np.expand_dims(independent_counts, 1)
+                    joint_counts = joint_counts / independent_counts
+                else:
+                    independent_counts = np.expand_dims(independent_counts, 1) * np.expand_dims(independent_counts, 0)
+                    joint_counts = [joint_counts / independent_counts]
+
+            sample_clusters = np.full_like(indices_sources, -1)
+            source_clusters = np.full((joint_counts[0].shape[0], len(joint_counts)), -1, dtype=sample_clusters.dtype)
+            for index_slice, jc in enumerate(joint_counts):
+
+                if knn is not None:
+                    indices_sort = np.argsort(-jc, axis=1)
+                    indices_sort = indices_sort[:, :knn]
+                    indices_sort_b = np.tile(
+                        np.expand_dims(np.arange(indices_sort.shape[0]), 1), (1, indices_sort.shape[1]))
+                    indices_sort = np.reshape(indices_sort, -1)
+                    indices_sort_b = np.reshape(indices_sort_b, -1)
+                    indicator_nearest = np.full_like(jc, False)
+                    indicator_nearest[(indices_sort, indices_sort_b)] = True
+                    indicator_nearest[(indices_sort_b, indices_sort)] = True
+                    jc = np.where(indicator_nearest, jc, 0)
+
+                spectral_clustering = SpectralClustering(
+                    n_clusters=n_clusters, affinity='precomputed', **spectral_kwargs)
+                # renumber the clusters here according to dipole order to
+                # try to keep the same cluster numbers across runs
+                source_clusters_ = _renumber_clusters(
+                    spectral_clustering.fit_predict(jc),
+                    source_clusters[:, index_slice - 1] - (index_slice - 1) * n_clusters if index_slice > 0 else None)
+                source_clusters_ = source_clusters_ + index_slice * n_clusters
+                source_clusters[:, index_slice] = source_clusters_
+                if time_slice_ms is not None:
+                    indices_time_slice = indices_time - index_slice * time_slice_ms
+                    indicator_slice = np.logical_and(indices_time_slice >= 0, indices_time_slice < time_slice_ms)
+                    sample_clusters[indicator_slice] = source_clusters_[indices_sources[indicator_slice]]
+                else:
+                    sample_clusters[:] = source_clusters_[indices_sources]
+
+            if time_slice_ms is None:
+                source_clusters = np.squeeze(source_clusters, axis=1)
+
+            if ignore_grid_on_aggregate:
+                segments = (indices_stimuli, indices_block, sample_clusters)
             else:
-                joint_counts += counts['joint_grid_element_count_{}'.format(block)]
-                if use_pointwise_mutual_information:
-                    independent_counts += counts['independent_grid_element_count_{}'.format(block)]
+                segments = (indices_stimuli, indices_block, sample_clusters, grid_elements)
 
-        if use_pointwise_mutual_information:
-            independent_counts = np.expand_dims(independent_counts, 1) * np.expand_dims(independent_counts, 0)
-            joint_counts = joint_counts / independent_counts
+            mean_w_segment = None
+            if aggregation == 'median' or aggregation == 'percentile_75':
+                c_hat_val = np.abs(c_hat)
+                if aggregation == 'percentile_75':
+                    c_hat_val = (c_hat_val, 0.75)
 
-        spectral_clustering = SpectralClustering(n_clusters=n_clusters, affinity='precomputed', **spectral_kwargs)
-        source_clusters = spectral_clustering.fit_predict(joint_counts)
-        sample_clusters = source_clusters[indices_sources]
+                (segments,
+                 segment_counts,
+                 w_segment,
+                 f_hat_segment,
+                 time_segment,
+                 interpolated_scale_frequencies_segment) = segment_median(
+                    segments, c_hat_val, f_hat, indices_time, interp_fs, min_count=min_events)
+            elif aggregation == 'power' or aggregation == 'amplitude':
+                segments, segment_counts, w_segment, mean_w_segment, power_weighted = segment_combine_events(
+                    segments, c_hat, min_count=min_events,
+                    power_weighted_dict={'f_hat': f_hat, 'time': indices_time, 'interp_fs': interp_fs},
+                    use_amplitude=aggregation == 'amplitude')
 
-        segments = np.concatenate([
-            np.expand_dims(indices_stimuli, 1),
-            np.expand_dims(indices_block, 1),
-            np.expand_dims(sample_clusters, 1),
-            np.expand_dims(grid_elements, 1)], axis=1)
+                f_hat_segment, time_segment, interpolated_scale_frequencies_segment = (
+                    power_weighted['f_hat'], power_weighted['time'], power_weighted['interp_fs'])
+            else:
+                raise ValueError('Unrecognized aggregation: {}'.format(aggregation))
 
-        rms_w_segment = None
-        if use_median:
-            (segments,
-             segment_counts,
-             w_segment,
-             f_hat_segment,
-             time_segment,
-             interpolated_scale_frequencies_segment) = segment_median(
-                segments, np.abs(c_hat), f_hat, indices_time, interp_fs, min_count=min_events)
+            result_dict = dict(
+                source_clusters=source_clusters,
+                counts=segment_counts,
+                magnitude=w_segment,
+                f_hat=f_hat_segment,
+                time=time_segment,
+                interpolated_scale_frequencies=interpolated_scale_frequencies_segment,
+                stimuli=segments[0],
+                blocks=segments[1],
+                sample_source_clusters=segments[2],
+                grid=counts['grid'])
+
+            if not ignore_grid_on_aggregate:
+                result_dict['grid_elements'] = segments[3]
+
+            if mean_w_segment is not None:
+                result_dict['magnitude_mean'] = mean_w_segment
+
             output_path = os.path.join(
                 element_analysis_dir,
-                'harry_potter_spectral_clustered_median_{subject}_hold_out_{hold_out}.npz'.format(
-                    subject=subject, hold_out=hold_out_block))
-        else:
-            segments, segment_counts, w_segment, rms_w_segment, power_weighted = segment_combine_events(
-                segments, c_hat, min_count=min_events,
-                power_weighted_dict={'f_hat': f_hat, 'time': indices_time, 'interp_fs': interp_fs})
-            f_hat_segment, time_segment, interpolated_scale_frequencies_segment = (
-                power_weighted['f_hat'], power_weighted['time'], power_weighted['interp_fs'])
-            output_path = os.path.join(
-                element_analysis_dir, 'harry_potter_spectral_clustered_{subject}_hold_out_{hold_out}.npz'.format(
-                    subject=subject, hold_out=hold_out_block))
+                'harry_potter_co_occurrence_clustered'
+                '_{aggregation}_{subject}{time_slice}_hold_out_{hold_out}.npz'.format(
+                    aggregation=aggregation,
+                    subject=subject,
+                    time_slice='_time_slice_ms_{}'.format(time_slice_ms) if time_slice_ms is not None else '',
+                    hold_out=hold_out_block))
 
-        result_dict = dict(
-            source_clusters=source_clusters,
-            counts=segment_counts,
-            magnitude=w_segment,
-            f_hat=f_hat_segment,
-            time=time_segment,
-            interpolated_scale_frequencies=interpolated_scale_frequencies_segment,
-            stimuli=segments[:, 0],
-            blocks=segments[:, 1],
-            sample_source_clusters=segments[:, 2],
-            grid_elements=segments[:, 3],
-            grid=counts['grid']
-        )
-
-        if rms_w_segment is not None:
-            result_dict['magnitude_rms'] = rms_w_segment
-
-        np.savez(output_path, **result_dict)
+            np.savez(output_path, **result_dict)
 
 
 def _insert_missing(block_stimuli, data, index):
@@ -411,100 +532,121 @@ def _insert_missing(block_stimuli, data, index):
     return block_stimuli, data
 
 
+def _aggregate_dense(dense_array, cluster_assignments, aggregation, **unique_kwargs):
+    unique_result = np.unique(cluster_assignments, **unique_kwargs)
+    if not isinstance(unique_result, tuple):
+        unique_result = (unique_result,)
+
+    unique_cluster_assignments = unique_result[0]
+    unique_cluster_assignments = unique_cluster_assignments[unique_cluster_assignments >= 0]
+
+    assert (np.array_equal(unique_cluster_assignments, np.arange(len(unique_cluster_assignments))))
+
+    result_data = np.full((dense_array.shape[1], len(unique_cluster_assignments)), np.nan, dtype=dense_array.dtype)
+
+    for c in unique_cluster_assignments:
+        indicator_cluster = c == cluster_assignments
+        if aggregation == 'sum' or aggregation == 'counts':
+            result_data[:, c] = nansum(dense_array[indicator_cluster], axis=0)
+        elif aggregation == 'mean':
+            result_data[:, c] = nanmean(dense_array[indicator_cluster], axis=0)
+        elif aggregation == 'median':
+            result_data[:, c] = nanmedian(dense_array[indicator_cluster], axis=0)
+        elif aggregation == 'percentile_75':
+            result_data[:, c] = np.nanquantile(dense_array[indicator_cluster], q=0.75, axis=0)
+        elif aggregation == 'L2':
+            result_data[:, c] = np.sqrt(nansum(np.square(dense_array[indicator_cluster]), axis=0))
+        elif aggregation == 'rms':
+            result_data[:, c] = np.sqrt(nanmean(np.square(dense_array[indicator_cluster]), axis=0))
+        else:
+            raise ValueError('Unknown aggregation_mode: {}'.format(aggregation))
+
+    return (result_data,) + unique_result
+
+
 def _rank_cluster_helper(
         dense_array,
-        block_stimuli,
-        source_clusters,
-        grid,
+        blocks,
         held_out_block,
         maximum_proportion_missing,
-        aggregation_mode,
-        use_mini_batch,
-        method,
-        method_kwargs):
+        aggregation,
+        n_clusters,
+        n_clusters_2,
+        spectral_kwargs,
+        spectral_radius):
 
-    indicator_held_out = block_stimuli[:, 0] == held_out_block
+    indicator_held_out = blocks == held_out_block
 
-    spectral_rank_clusters = np.full(dense_array.shape[:2], -1, dtype=np.int32)
-    indices_source_cluster, indices_element = np.unravel_index(
-        np.arange(dense_array.shape[0] * dense_array.shape[1]), dense_array.shape[:2])
-    dense_array = np.reshape(dense_array, (dense_array.shape[0] * dense_array.shape[1], dense_array.shape[2]))
+    co_occurrence_rank_clusters = np.full(dense_array.shape[:-1], -1, dtype=np.int32)
+    co_occurrence_rank_clusters_2 = None
+    if n_clusters_2 is not None:
+        co_occurrence_rank_clusters_2 = np.copy(co_occurrence_rank_clusters)
+    dense_array = np.reshape(dense_array, (int(np.prod(dense_array.shape[:-1])), dense_array.shape[-1]))
 
     train_array = dense_array[:, np.logical_not(indicator_held_out)]
 
-    indicator_enough_data = (np.count_nonzero(np.isnan(train_array), axis=1) / train_array.shape[1]
-                             <= maximum_proportion_missing)
+    indicator_enough_data = None
+    if maximum_proportion_missing is not None:
+        indicator_enough_data = (
+                np.count_nonzero(np.isnan(train_array), axis=1) / train_array.shape[1] <= maximum_proportion_missing)
+        train_array = train_array[indicator_enough_data]
 
-    train_array = train_array[indicator_enough_data]
-
-    train_array = nanrankdata(train_array, axis=1)
-
-    if method == 'k_pod':
-        rank_clusters, centroids, _ = k_pod(train_array, use_mini_batch=use_mini_batch, **method_kwargs)
-    elif method == 'spectral':
-        from sklearn.cluster import SpectralClustering
+    # the user can pass n_clusters >= dense_array.shape[0] to bypass rank-clustering and just cause dense
+    # aggregation on the input, so we skip a bunch of work if that is the case
+    if n_clusters < dense_array.shape[0] or (n_clusters_2 is not None and n_clusters_2 < dense_array.shape[0]):
         train_array = nanrankdata(train_array, axis=1)
-        tau, num_common = kendall_tau(train_array)
-        affinity = (tau + 1) * num_common
-        spectral = SpectralClustering(affinity='precomputed', **method_kwargs)
-        rank_clusters = spectral.fit_predict(affinity)
-        np.savez('/share/volume0/drschwar/data_sets/harry_potter/element_analysis/rank_spectral_affinity.npz',
-                 affinity=affinity,
-                 tau=tau)
-        del affinity
-        centroids = None
+        tau, _ = kendall_tau(train_array)
+        # can be nan if num_common is < 2
+        affinity = np.where(np.isnan(tau), 0, tau + 1)
+        if spectral_radius is not None:
+            affinity = np.where(affinity >= spectral_radius, affinity - spectral_radius, 0)
     else:
-        raise ValueError('Unknown method: {}'.format(method))
+        tau = None
+        affinity = None
+        del train_array
 
-    unique_rank_clusters, inverse = np.unique(rank_clusters, return_inverse=True)
-    assert (np.array_equal(unique_rank_clusters, np.arange(len(unique_rank_clusters))))
+    result = list()
+    for n, co_occurrence_clusters in [
+            (n_clusters, co_occurrence_rank_clusters), (n_clusters_2, co_occurrence_rank_clusters_2)]:
+        if n is None:
+            break
 
-    indices_spectral_rank_clusters = np.unravel_index(
-        np.arange(spectral_rank_clusters.size)[indicator_enough_data], spectral_rank_clusters.shape)
-    spectral_rank_clusters[indices_spectral_rank_clusters] = inverse
-
-    dense_array = dense_array[indicator_enough_data]
-    indices_source_cluster = indices_source_cluster[indicator_enough_data]
-    indices_element = indices_element[indicator_enough_data]
-    result_data = np.full((dense_array.shape[1], len(unique_rank_clusters)), np.nan, dtype=dense_array.dtype)
-    source_rank_clusters = np.full((len(source_clusters), len(grid)), -1, dtype=np.int32)
-
-    is_manual_centroids = centroids is None
-    if is_manual_centroids:
-        centroids = np.full((len(unique_rank_clusters),) + train_array.shape[1:], np.nan, dtype=train_array.dtype)
-
-    for c in unique_rank_clusters:
-        indicator_cluster = c == rank_clusters
-        if is_manual_centroids:
-            centroids[c] = nanmean(train_array[indicator_cluster], axis=0)
-        if aggregation_mode == 'sum' or aggregation_mode == 'counts':
-            result_data[:, c] = nansum(dense_array[indicator_cluster], axis=0)
-        elif aggregation_mode == 'mean':
-            result_data[:, c] = nanmean(dense_array[indicator_cluster], axis=0)
-        elif aggregation_mode == 'median':
-            result_data[:, c] = nanmedian(dense_array[indicator_cluster], axis=0)
-        elif aggregation_mode == 'L2':
-            result_data[:, c] = np.sqrt(nansum(np.square(dense_array[indicator_cluster]), axis=0))
+        if n < dense_array.shape[0]:
+            spectral = SpectralClustering(n_clusters=n, affinity='precomputed', **spectral_kwargs)
+            indicator_connected = np.count_nonzero(affinity > 0, axis=0) > 1
+            rank_clusters_ = spectral.fit_predict(affinity[indicator_connected][:, indicator_connected])
+            rank_clusters = np.full(indicator_connected.shape, -1, dtype=rank_clusters_.dtype)
+            rank_clusters[indicator_connected] = rank_clusters_
+            del rank_clusters_
         else:
-            raise ValueError('Unknown aggregation_mode: {}'.format(aggregation_mode))
-        indices_source_cluster_match = indices_source_cluster[indicator_cluster]
-        indices_element_match = indices_element[indicator_cluster]
-        for s, e in zip(indices_source_cluster_match, indices_element_match):
-            indices_source = np.flatnonzero(source_clusters == s)
-            source_rank_clusters[indices_source, e] = c
+            rank_clusters = np.arange(dense_array.shape[0])
 
-    return (
-        result_data,
-        block_stimuli[:, 1],
-        block_stimuli[:, 0],
-        source_rank_clusters,
-        spectral_rank_clusters,
-        centroids)
+        if indicator_enough_data is not None:
+            dense_array = dense_array[indicator_enough_data]
+
+        result_data, unique_rank_clusters, inverse = _aggregate_dense(
+            dense_array, rank_clusters, aggregation=aggregation, return_inverse=True)
+
+        if indicator_enough_data is not None:
+            indices_co_occurrence_rank_clusters = np.unravel_index(
+                np.arange(co_occurrence_clusters.size)[indicator_enough_data], co_occurrence_clusters.shape)
+        else:
+            indices_co_occurrence_rank_clusters = np.unravel_index(
+                np.arange(co_occurrence_clusters.size), co_occurrence_clusters.shape)
+
+        co_occurrence_clusters[indices_co_occurrence_rank_clusters] = unique_rank_clusters[inverse]
+        result.append(result_data)
+        result.append(co_occurrence_clusters)
+
+    result.append(tau)
+    result.append(affinity)
+
+    return tuple(result)
 
 
 def rank_cluster_only_combine_block(element_analysis_dir, subject, block, grid, source_rank_clusters, aggregation):
     """
-    Computes aggregate events for each (source, rank-cluster) tuple bypassing spectral cluster aggregation. This
+    Computes aggregate events for each (source, rank-cluster) tuple bypassing co-occurrence cluster aggregation. This
     can be useful for comparing a predicted result to a ground-truth value at each dipole.
     Args:
         element_analysis_dir: The directory where element analysis files can be found. For example:
@@ -516,29 +658,30 @@ def rank_cluster_only_combine_block(element_analysis_dir, subject, block, grid, 
             for each (source, grid-element) tuple. Available in the rank-cluster file as
             'source_rank_clusters_<subject>_hold_out_<held-out-block>'
         aggregation:
-            If 'median', uses harry_potter_spectral_clustered_median_{subject}_hold_out_{hold_out}.npz as
-                input, thereby using the median absolute wavelet coefficient of the spectral clusters to rank
-                epochs when rank clustering. Also combines values from the spectral clusters using the median.
-            If 'counts', uses harry_potter_spectral_clustered_median_{subject}_hold_out_{hold_out}.npz as
-                input, but uses the number of events in each spectral cluster instead of the wavelet coefficients
-                to rank epochs when rank clustering. Combines values (counts) from the spectral clusters by summing.
-            If 'L2' (default), uses harry_potter_spectral_clustered_{subject}_hold_out_{hold_out}.npz as input, thereby
-                using the L2-norm of the absolute value of the wavelet coefficients of the spectral clusters to rank
-                epochs when rank clustering. Combines values from spectral clusters using the L2-norm.
-
+            If 'median', uses the median absolute wavelet coefficient of the events in all dipoles belonging to a
+                rank cluster as the value for that cluster for an epoch.
+            If 'counts', uses the total number of events in all dipoles belonging to a rank cluster as the value for
+                that cluster for an epoch.
+            If 'rms', uses the root-mean-squared absolute wavelet coefficient of all events in all dipoles belonging to
+                a rank cluster as the value for that cluster for an epoch.
+            If 'L2' (default), uses the L2-norm of the absolute wavelet coefficient of all events in all dipoles
+                belonging to a rank cluster as the value for that cluster for an epoch.
+            If 'mean', uses the mean of the absolute wavelet coefficient of all events in all dipoles
+                belonging to a rank cluster as the value for that cluster for an epoch.
+            If 'sum', uses the total of the absolute wavelet coefficient of all events in all dipoles
+                belonging to a rank cluster as the value for that cluster for an epoch.
     Returns:
         combined_events: A 3d array with shape (num_epochs, num_sources, num_rank_clusters) containing the aggregated
             events
     """
     ea_path = os.path.join(
         element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
-    ea_block = np.load(ea_path)
-
-    indices_stimuli, indices_source, _, indices_time = np.unravel_index(
-        ea_block['indices_flat'], ea_block['shape'])
-    ea_morse = ElementAnalysisMorse(ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
-    c_hat, _, f_hat = ea_morse.event_parameters(
-        ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
+    with np.load(ea_path) as ea_block:
+        indices_stimuli, indices_source, _, indices_time = np.unravel_index(
+            ea_block['indices_flat'], ea_block['shape'])
+        ea_morse = ElementAnalysisMorse(ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
+        c_hat, _, f_hat = ea_morse.event_parameters(
+            ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
     indices_grid = assign_grid_labels(grid, indices_time, f_hat)
     del indices_time
     del f_hat
@@ -561,8 +704,16 @@ def rank_cluster_only_combine_block(element_analysis_dir, subject, block, grid, 
         unique_segments, _, w = segment_median(segments, np.abs(c_hat))
         dense_array[(
             unique_segments[:, 0], unique_segments[:, 1], unique_segments[:, 2])] = w
-    elif aggregation == 'L2':
-        unique_segments, _, w = segment_combine_events(segments, c_hat)
+    elif aggregation == 'L2' or aggregation == 'rms':
+        unique_segments, _, w, w_rms = segment_combine_events(segments, c_hat)
+        if aggregation == 'rms':
+            w = w_rms
+        dense_array[(
+            unique_segments[:, 0], unique_segments[:, 1], unique_segments[:, 2])] = w
+    elif aggregation == 'sum' or aggregation == 'mean':
+        unique_segments, _, w, w_mean = segment_combine_events(segments, c_hat, use_amplitude=True)
+        if aggregation == 'mean':
+            w = w_mean
         dense_array[(
             unique_segments[:, 0], unique_segments[:, 1], unique_segments[:, 2])] = w
     else:
@@ -573,131 +724,262 @@ def rank_cluster_only_combine_block(element_analysis_dir, subject, block, grid, 
 
 def rank_cluster(
         element_analysis_dir,
-        maximum_proportion_missing=0.1,
         aggregation='L2',
+        maximum_proportion_missing=None,
+        single_subject=None,
+        spectral_radius=1.1,
+        n_clusters=300,
         n_multi_subject_clusters=None,
-        method='k_pod',
-        **method_kwargs):
+        n_multi_subject_input_clusters=None,
+        time_slice_ms=None,
+        **spectral_kwargs):
     """
-    Uses k-means clustering treating each (source-cluster, grid-element) tuple as a sample and the rank-order
-    of the epochs as the features. (source-cluster, grid-element) tuples having more than maximum_proportion_missing
-    missing epochs will be dropped from the data instead of clustered. The k-pod variant of k-means is used to
-    handle missing epochs in the remaining data.
+    Uses spectral clustering, computing an affinity matrix between each (source-cluster, grid-element) tuple and each
+    other (source-cluster, grid-element) tuple. The affinity matrix is computed ranking the epochs according to the
+    values for each epoch within a (source-cluster, grid-element) tuple and then computing Kendall's tau-b between each
+    pair of (source-cluster, grid-element) tuples on this ranked data.
     Args:
         element_analysis_dir: The directory where element analysis files can be found. For example:
             '/share/volume0/<your user name>/data_sets/harry_potter/element_analysis'
-        maximum_proportion_missing: (source-cluster, grid-element) tuples having more than maximum_proportion_missing
-            missing epochs will be dropped from the data instead of clustered.
         aggregation:
-            If 'median', uses harry_potter_spectral_clustered_median_{subject}_hold_out_{hold_out}.npz as
-                input, thereby using the median absolute wavelet coefficient of the spectral clusters to rank
-                epochs when rank clustering. Also combines values from the spectral clusters using the median.
-            If 'counts', uses harry_potter_spectral_clustered_median_{subject}_hold_out_{hold_out}.npz as
-                input, but uses the number of events in each spectral cluster instead of the wavelet coefficients
-                to rank epochs when rank clustering. Combines values (counts) from the spectral clusters by summing.
-            If 'L2' (default), uses harry_potter_spectral_clustered_{subject}_hold_out_{hold_out}.npz as input, thereby
-                using the L2-norm of the absolute value of the wavelet coefficients of the spectral clusters to rank
-                epochs when rank clustering. Combines values from spectral clusters using the L2-norm.
+            If 'median', uses harry_potter_co_occurrence_clustered_median_{subject}_hold_out_{hold_out}.npz as
+                input, taking the median absolute wavelet coefficient of the co-occurrence clusters to rank
+                epochs when rank clustering. Also combines values from the co-occurrence clusters using the median.
+            If 'counts', uses harry_potter_co_occurrence_clustered_median_{subject}_hold_out_{hold_out}.npz as
+                input, taking the number of events in each co-occurrence cluster instead of the wavelet coefficients
+                to rank epochs when rank clustering. Combines values (counts) from the co-occurrence clusters by
+                summing.
+            If 'rms', uses harry_potter_co_occurrence_clustered_{subject}_hold_out_{hold_out}.npz as input, taking
+                the root-mean-squared aggregates from that file to rank epochs when rank clustering. Combines values
+                from co-occurrence clusters using the root-mean-squared value.
+            If 'L2', uses harry_potter_co_occurrence_clustered_{subject}_hold_out_{hold_out}.npz as input,
+                taking the L2-norm of the absolute value of the wavelet coefficients of the co-occurrence
+                clusters to rank epochs when rank clustering. Combines values from co-occurrence clusters using the
+                L2-norm.
+            If 'mean', uses harry_potter_co_occurrence_clustered_amplitude_{subject}_hold_out_{hold_out}.npz as input,
+                taking the mean of the absolute value of the wavelet coefficients of the co-occurrence clusters to rank
+                epochs when rank clustering. Combines values from co-occurrence clusters using the mean.
+            If 'sum', uses harry_potter_co_occurrence_clustered_amplitude_{subject}_hold_out_{hold_out}.npz as input,
+                taking the sum of the absolute value of the wavelet coefficients of the co-occurrence clusters to rank
+                epochs when rank clustering. Combines values from co-occurrence clusters using the sum.
+        maximum_proportion_missing: (source-cluster, grid-element) tuples having more than maximum_proportion_missing
+            missing epochs will be dropped from the data instead of clustered. If None (default), no tuples will be
+            dropped.
+        n_clusters: The number of single-subject clusters to produce. If None, then rank-clustering is bypassed for
+            single subjects, and this function only converts the input data to a dense array. Multi-subject
+            rank-clustering can still be used in that case.
         n_multi_subject_clusters:
             If None, then the number of multi-subject clusters will be the same as the number of single-subject
             clusters. Set to 0 to turn off multi-subject clustering.
-        method: What method to use for clustering. Either k_pod or spectral
-        **method_kwargs: Additional arguments to clustering method
+        n_multi_subject_input_clusters:
+            If None or not 0, multi-subject clustering is done by first clustering each subject independently and then
+            by clustering the clusters. If set to 0, multi-subject clustering is done directly on the input data by
+            concatenating the subject data together. Direct clustering is impractical when the aggregated co-occurrence
+            data is too large, so use n_multi_subject_input_clusters=0 with caution. When not 0, this determines the
+            number of clusters used in the first stage of multi-subject clustering (i.e. the stage in which each
+            subject's data is clustered independently. If this value is the same as n_clusters, then the input to the
+            multi-subject clustering is identical to the single-subject clusters, but for other values two different
+            subject level clusterings are computed. Setting this value to None (the default) is equivalent to using
+            2 * n_multi_subject_clusters (or 2 * n_clusters when n_multi_subject_clusters is None).
+        single_subject: If specified, clustering is performed only on the specified subject. No multi-subject
+            clustering is performed, and the output file is suffixed with the subject name. This is useful for
+            trialing changes to the clustering without waiting for all subjects to be processed.
+        spectral_radius: If specified, affinity below this value will be set to 0 to create a knn-graph for
+            spectral clustering instead of using a fully-connected graph. This value is applied after
+            the Kendall's tau is transformed to affinity. affinity < 1 is a negative correlation, affinity = 2 is
+            perfect correlation, so 1.1 is a reasonable value here.
+        time_slice_ms: If provided, clusters are computed within slices of the time spanning this many ms. Must have
+            run co_occurrence_source_cluster with this value of time_slice_ms before running this step.
+        **spectral_kwargs: Additional arguments to sklearn.cluster.SpectralClustering
 
     Returns:
-        Saves a new file into element_analysis_dir with name harry_potter_rank_clustered.npz
+        Saves a new file into element_analysis_dir with name harry_potter_meg_rank_clustered_<aggregation>.npz
         Note that the file has data for each subject and hold out.
 
         description: Comments about what this data file contains.
-        grid: The boundaries of the grid elements (copied from input data). A 2d array with shape
-            (num_grid_elements, 4) giving (low-time, high-time, low-freq, high-freq) coordinates for each grid-element.
-        stimuli: The index of the stimulus (within block) corresponding to each row of data_<held-out-block>
-        blocks: The block corresponding to each row of data_<held-out-block>
-        spectral_source_clusters_<subject>_hold_out_<held-out-block>:
-            The spectral cluster assignment for each source (copied from input data).
-            A 1d array with shape (num_sources,)
+        grid: The boundaries of the grid elements. A 2d array with shape (num_grid_cells, 4) giving
+            (low-time, high-time, low-freq, high-freq) coordinates for each grid-cell. The high-time
+            and high-freq boundaries are exclusive, the low-time and low-freq boundaries are inclusive.
+            Grid-cells at the lowest-frequency have an open-lower bound, meaning events which fall below the
+            lowest-frequency are put into the lowest frequency bins at the same time interval. Similarly, events
+            which occur at a higher frequency than the highest frequency bins are put into the highest frequency
+            bins at the same time interval.
+        stimuli: The text of the stimulus corresponding to each row of data_<subject>_hold_out_<held-out-block>
+        blocks: The block corresponding to each row of data_<subject>_hold_out_<held-out-block>
+        co_occurrence_clusters_<subject>_hold_out_<held-out-block>:
+            The co-occurrence cluster assignment for each source. Spatial clustering only (copied from input data).
+            A 1d array with shape (num_sources,). This is the result of co_occurrence_source_cluster.
         source_rank_clusters_<subject>_hold_out_<held-out-block>: The rank-cluster assignment for each
-            (source, grid-element) tuple. A 2d array with shape (num_sources, num_grid_elements)
-        spectral_rank_clusters_<subject>_hold_out_<held-out-block>: The rank-cluster assignment for each
-            (spectral_cluster, grid-element) tuple. A 2d array with shape (num_spectral_clusters, num_grid_elements)
-        rank_cluster_centroids_<subject>_hold_out_<held-out-block>: The centroids for each rank-cluster.
-            A 2d array of shape (num_rank_clusters, num_train_epochs)
+            (source, grid-cell) tuple. A 2d array with shape (num_sources, num_grid_cells)
+        co_occurrence_rank_clusters_<subject>_hold_out_<held-out-block>: The rank-cluster assignment for each
+            (co_occurrence_cluster, grid-cell) tuple.
+            A 2d array with shape (num_co_occurrence_clusters, num_grid_cells)
         data_<subject>_hold_out_<held-out-block>:
-            The L2 norm of the input magnitudes for each cluster. A 2d array with shape
-            (num_stimuli, n_clusters)
+            The aggregate values for each cluster, computed according the specified aggregation method
+            (see aggregation). A 2d array with shape (num_stimuli, n_clusters). Note that this contains data for all
+            blocks, but the clustering is fit without the held out block.
+        source_rank_clusters_multi_subject_<subject>_hold_out_<held-out-block>:
+            Similar to source_rank_clusters_<subject>_hold_out_<held-out-block>, but contains the cluster
+            assignments when all of the subjects are clustered jointly. These are still separated out by subject
+            even in the multi-subject clustering case
+        co_occurrence_rank_clusters_multi_subject_<subject>_hold_out_<held-out-block>:
+            Similar to spectral_rank_clusters_<subject>_hold_out_<held-out-block>, but contains the cluster
+            assignments when all of the subjects are clustered jointly. These are still separated out by subject
+            even in the multi-subject clustering case
+        data_multi_subject_hold_out_<held-out-block>:
+            The aggregate values for each cluster when the subjects are clustered jointly.
+            A 2d array with shape (num_stimuli, n_clusters). Note that this contains data for all blocks,
+            but the clustering is fit without the held out block.
     """
     all_blocks = 1, 2, 3, 4
-    # all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
-    all_subjects = 'A',
+    all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
+    if single_subject is not None:
+        all_subjects = (single_subject,)
 
     # subject A has 2 '+' stimuli missing
     a_insert_indices = 1302, 2653
 
+    if aggregation == 'median' or aggregation == 'counts':
+        co_occurrence_aggregation = 'median'
+    elif aggregation == 'percentile_75':
+        co_occurrence_aggregation = 'percentile_75'
+    elif aggregation == 'L2' or aggregation == 'rms':
+        co_occurrence_aggregation = 'power'
+    elif aggregation == 'mean' or aggregation == 'sum':
+        co_occurrence_aggregation = 'amplitude'
+    else:
+        raise ValueError('Unrecognized aggregation: {}'.format(aggregation))
+
     result = dict()
-    n_clusters = None
+
+    is_n_clusters_explicit = n_clusters is not None
 
     for held_out_block in tqdm(all_blocks, desc='hold_out_block'):
 
         multi_subject_arrays = list()
-        multi_subject_block_stimuli = None
+        multi_subject_input_aggregates = list()
         multi_subject_source_clusters = list()
-        multi_subject_source_cluster_offset = 0
+        multi_subject_co_occurrence_clusters = list()
 
         for subject in tqdm(all_subjects, desc='subject', leave=False):
-            if aggregation == 'median' or aggregation == 'counts':
-                spectral_clustered_path = os.path.join(
-                    element_analysis_dir,
-                    'harry_potter_spectral_clustered_median_{subject}_hold_out_{block}.npz'.format(
-                        subject=subject, block=held_out_block))
-            elif aggregation == 'L2':
-                spectral_clustered_path = os.path.join(
-                    element_analysis_dir,
-                    'harry_potter_spectral_clustered_{subject}_hold_out_{block}.npz'.format(
-                        subject=subject, block=held_out_block))
-            else:
-                raise ValueError('Unrecognized mode: {}'.format(aggregation))
 
-            spectral_clustered = np.load(spectral_clustered_path)
+            co_occurrence_clustered_path = os.path.join(
+                element_analysis_dir,
+                'harry_potter_co_occurrence_clustered'
+                '_{co_occurrence_aggregation}_{subject}{time_slice}_hold_out_{block}.npz'.format(
+                    co_occurrence_aggregation=co_occurrence_aggregation,
+                    subject=subject,
+                    time_slice='_time_slice_ms_{}'.format(time_slice_ms) if time_slice_ms is not None else '',
+                    block=held_out_block))
 
-            grid = spectral_clustered['grid']
-            w = spectral_clustered['magnitude']
-            counts = spectral_clustered['counts']
-            blocks = spectral_clustered['blocks']
-            stimuli = spectral_clustered['stimuli']
-            elements = spectral_clustered['grid_elements']
-            sample_source_clusters = spectral_clustered['sample_source_clusters']
-            source_clusters = spectral_clustered['source_clusters']
+            with np.load(co_occurrence_clustered_path) as co_occurrence_clustered:
+                grid = co_occurrence_clustered['grid']
+                if aggregation == 'rms' or aggregation == 'mean':
+                    w = co_occurrence_clustered['magnitude_mean']
+                else:
+                    w = co_occurrence_clustered['magnitude']
+                counts = co_occurrence_clustered['counts']
+                blocks = co_occurrence_clustered['blocks']
+                stimuli = co_occurrence_clustered['stimuli']
+                elements = co_occurrence_clustered['grid_elements'] \
+                    if 'grid_elements' in co_occurrence_clustered else None
+                sample_co_occurrence_clusters = co_occurrence_clustered['sample_source_clusters']
+                source_clusters = co_occurrence_clustered['source_clusters']
 
             block_stimuli, virtual_stim = np.unique(
                 np.concatenate([np.expand_dims(blocks, 1), np.expand_dims(stimuli, 1)], axis=1),
                 axis=0, return_inverse=True)
 
-            dense_array = np.full(
-                (np.max(sample_source_clusters) + 1, np.max(elements) + 1, np.max(virtual_stim) + 1), np.nan)
+            if elements is None:
+                dense_array = np.full(
+                    (np.max(sample_co_occurrence_clusters) + 1, np.max(virtual_stim) + 1), np.nan)
 
-            if aggregation == 'counts':
-                dense_array[(sample_source_clusters, elements, virtual_stim)] = counts
+                if aggregation == 'counts':
+                    dense_array[(sample_co_occurrence_clusters, virtual_stim)] = counts
+                else:
+                    dense_array[(sample_co_occurrence_clusters, virtual_stim)] = w
             else:
-                dense_array[(sample_source_clusters, elements, virtual_stim)] = w
+                dense_array = np.full(
+                    (np.max(sample_co_occurrence_clusters) + 1, np.max(elements) + 1, np.max(virtual_stim) + 1), np.nan)
+
+                if aggregation == 'counts':
+                    dense_array[(sample_co_occurrence_clusters, elements, virtual_stim)] = counts
+                else:
+                    dense_array[(sample_co_occurrence_clusters, elements, virtual_stim)] = w
+
+            if n_clusters is None:
+                n_clusters = int(np.prod(dense_array.shape[:-1]))
+            elif not is_n_clusters_explicit:
+                # we require that all of the subjects have the same number of clusters in this mode
+                if n_clusters != int(np.prod(dense_array.shape[:-1])):
+                    raise ValueError('The number of input clusters must be consistent across all subjects '
+                                     'if n_clusters is set to None')
+
+            if n_multi_subject_clusters is None:
+                n_multi_subject_clusters = n_clusters
+
+            if n_multi_subject_input_clusters is None:
+                n_multi_subject_input_clusters = 2 * n_multi_subject_clusters
 
             if subject == 'A':
                 for idx in a_insert_indices:
                     block_stimuli, dense_array = _insert_missing(block_stimuli, dense_array, idx)
 
-            if n_multi_subject_clusters != 0:
-                multi_subject_arrays.append(dense_array)
-                if multi_subject_block_stimuli is None:
-                    multi_subject_block_stimuli = block_stimuli
-                else:
-                    assert(np.array_equal(multi_subject_block_stimuli, block_stimuli))
-                multi_subject_source_clusters.append(source_clusters + multi_subject_source_cluster_offset)
-                multi_subject_source_cluster_offset += np.max(source_clusters) + 1
+            blocks = block_stimuli[:, 0]
+            stimuli = block_stimuli[:, 1]
 
-            result_data, stimuli, blocks, source_rank_clusters, spectral_rank_clusters, centroids = \
-                _rank_cluster_helper(
-                    dense_array, block_stimuli, source_clusters, grid, held_out_block, maximum_proportion_missing,
-                    aggregation_mode=aggregation, use_mini_batch=False, method=method, method_kwargs=method_kwargs)
-            n_clusters = result_data.shape[1]
+            result_data_ms_input = None
+            co_occurrence_rank_clusters_ms_input = None
+            if n_multi_subject_clusters != 0 \
+                    and single_subject is None \
+                    and n_multi_subject_input_clusters != n_clusters \
+                    and n_multi_subject_input_clusters != 0:
+                (result_data,
+                 co_occurrence_rank_clusters,
+                 result_data_ms_input,
+                 co_occurrence_rank_clusters_ms_input,
+                 tau,
+                 affinity) = \
+                    _rank_cluster_helper(
+                        dense_array, blocks, held_out_block,
+                        maximum_proportion_missing,
+                        aggregation=aggregation,
+                        n_clusters=n_clusters,
+                        n_clusters_2=n_multi_subject_input_clusters,
+                        spectral_kwargs=spectral_kwargs,
+                        spectral_radius=spectral_radius)
+            else:
+                result_data, co_occurrence_rank_clusters, tau, affinity = \
+                    _rank_cluster_helper(
+                        dense_array, blocks, held_out_block,
+                        maximum_proportion_missing,
+                        aggregation=aggregation,
+                        n_clusters=n_clusters,
+                        n_clusters_2=None,
+                        spectral_kwargs=spectral_kwargs,
+                        spectral_radius=spectral_radius)
+                if n_multi_subject_clusters != 0 and single_subject is None:
+                    result_data_ms_input, co_occurrence_rank_clusters_ms_input = \
+                        result_data, co_occurrence_rank_clusters
+
+            # these could be None if n_clusters >= num_co_occurrence_clusters
+            if tau is not None or affinity is not None:
+                affinity_path = os.path.join(
+                    element_analysis_dir,
+                    'harry_potter_rank_affinity'
+                    '_{co_occurrence_aggregation}_{subject}{time_slice}_hold_out_{block}.npz'.format(
+                        co_occurrence_aggregation=co_occurrence_aggregation,
+                        subject=subject,
+                        time_slice='_time_slice_ms_{}'.format(time_slice_ms) if time_slice_ms is not None else '',
+                        block=held_out_block))
+
+                np.savez(affinity_path, tau=tau, affinity=affinity)
+                del tau
+                del affinity
+
+            source_rank_clusters = np.reshape(
+                co_occurrence_rank_clusters[np.reshape(source_clusters, -1)],
+                source_clusters.shape + co_occurrence_rank_clusters.shape[1:])
 
             if 'grid' in result:
                 assert np.array_equal(result['grid'], grid)
@@ -708,45 +990,90 @@ def rank_cluster(
                 result['stimuli'] = stimuli
                 result['blocks'] = blocks
 
-            result['spectral_source_clusters_{}_hold_out_{}'.format(subject, held_out_block)] = source_clusters
+            result['co_occurrence_clusters_{}_hold_out_{}'.format(subject, held_out_block)] = source_clusters
             result['source_rank_clusters_{}_hold_out_{}'.format(subject, held_out_block)] = source_rank_clusters
-            result['spectral_rank_clusters_{}_hold_out_{}'.format(subject, held_out_block)] = spectral_rank_clusters
-            result['rank_cluster_centroids_{}_hold_out_{}'.format(subject, held_out_block)] = centroids
+            result['co_occurrence_rank_clusters_{}_hold_out_{}'.format(subject, held_out_block)] = \
+                co_occurrence_rank_clusters
             result['data_{}_hold_out_{}'.format(subject, held_out_block)] = result_data
 
-        if n_multi_subject_clusters != 0:
-            method_kwargs_multi = dict(method_kwargs)
-            method_kwargs_multi['n_clusters'] = n_multi_subject_clusters \
-                if n_multi_subject_clusters is not None else n_clusters
+            if result_data_ms_input is not None:
+                if n_multi_subject_input_clusters != 0:  # not direct clustering
+                    source_rank_clusters_ms_input = np.reshape(
+                        co_occurrence_rank_clusters_ms_input[np.reshape(source_clusters, -1)],
+                        source_clusters.shape + co_occurrence_rank_clusters_ms_input.shape[1:])
+                    multi_subject_source_clusters.append(source_rank_clusters_ms_input)
+                    multi_subject_co_occurrence_clusters.append(co_occurrence_rank_clusters_ms_input)
+                    multi_subject_input_aggregates.append(result_data_ms_input)
+                else:  # direct clustering
+                    multi_subject_source_clusters.append(source_clusters)
 
-            result_data, stimuli, blocks, source_rank_clusters, spectral_rank_clusters, centroids = \
-                _rank_cluster_helper(
+                multi_subject_arrays.append(dense_array)
+
+        if n_multi_subject_clusters != 0 and single_subject is None:
+
+            if n_multi_subject_input_clusters == 0:
+                result_data, ms_rank_clusters, _, _ = _rank_cluster_helper(
                     np.concatenate(multi_subject_arrays),
-                    multi_subject_block_stimuli,
-                    np.concatenate(multi_subject_source_clusters),
-                    result['grid'],
-                    held_out_block, maximum_proportion_missing,
-                    aggregation_mode=aggregation,
-                    use_mini_batch=False,
-                    method=method,
-                    method_kwargs=method_kwargs_multi)
+                    result['blocks'], held_out_block, maximum_proportion_missing,
+                    aggregation=aggregation,
+                    n_clusters=n_multi_subject_clusters,
+                    n_clusters_2=None,
+                    spectral_radius=spectral_radius,
+                    spectral_kwargs=spectral_kwargs)
+                ms_rank_clusters = np.split(ms_rank_clusters, len(multi_subject_arrays), axis=0)
+            else:
+                ms_input = np.concatenate(multi_subject_input_aggregates, axis=1)
+                ms_train = ms_input[np.logical_not(result['blocks'] == held_out_block)]
+                ms_train = nanrankdata(ms_train, axis=0)
+                ms_tau, _ = kendall_tau(ms_train.T)
+                # can be nan if num_common is < 2
+                ms_affinity = np.where(np.isnan(ms_tau), 0, ms_tau + 1)
+                if spectral_radius is not None:
+                    ms_affinity = np.where(ms_affinity >= spectral_radius, ms_affinity, 0)
+                ms_spectral = SpectralClustering(
+                    n_clusters=n_multi_subject_clusters, affinity='precomputed', **spectral_kwargs)
+                # remove nodes that are not connected to anything
+                indicator_connected = np.count_nonzero(ms_affinity > 0, axis=0) > 1
+                ms_rank_clusters_ = ms_spectral.fit_predict(ms_affinity[indicator_connected][:, indicator_connected])
+                ms_rank_clusters = np.full(indicator_connected.shape, -1, dtype=ms_rank_clusters_.dtype)
+                ms_rank_clusters[indicator_connected] = ms_rank_clusters_
+                del ms_rank_clusters_
 
-            assert np.array_equal(result['stimuli'], stimuli)
-            assert np.array_equal(result['blocks'], blocks)
+                ms_rank_clusters = np.split(ms_rank_clusters, len(multi_subject_input_aggregates), axis=0)
+                result_data = None
 
-            source_rank_clusters = np.split(
-                source_rank_clusters, np.cumsum(list(len(sc) for sc in multi_subject_source_clusters))[:-1])
-            spectral_rank_clusters = np.split(
-                spectral_rank_clusters, np.cumsum(list(a.shape[0] for a in multi_subject_arrays))[:-1])
-
-            result['rank_cluster_centroids_multi_subject_hold_out_{}'.format(held_out_block)] = centroids
-            result['data_multi_subject_hold_out_{}'.format(held_out_block)] = result_data
-
-            for idx_subject, subject in enumerate(all_subjects):
+            for idx_subject, (subject, ms_rank_clusters_subject) in enumerate(zip(all_subjects, ms_rank_clusters)):
+                # ms_rank_clusters maps from multi-subject-input-cluster to multi-subject-cluster, so just index into
+                # it with our multi-subject-input-cluster information to replace multi-subject-input-cluster
+                # information with multi-subject-cluster information
+                multi_subject_source_clusters[idx_subject] = np.reshape(
+                    ms_rank_clusters_subject[np.reshape(multi_subject_source_clusters[idx_subject], -1)],
+                    multi_subject_source_clusters[idx_subject].shape)
                 result['source_rank_clusters_multi_subject_{}_hold_out_{}'.format(subject, held_out_block)] = \
-                    source_rank_clusters[idx_subject]
-                result['spectral_rank_clusters_multi_subject_{}_hold_out_{}'.format(subject, held_out_block)] = \
-                    spectral_rank_clusters[idx_subject]
+                    multi_subject_source_clusters[idx_subject]
+
+                if n_multi_subject_input_clusters == 0:  # direct clustering
+                    result['co_occurrence_rank_clusters_multi_subject_{}_hold_out_{}'.format(
+                        subject, held_out_block)] = ms_rank_clusters_subject
+                else:
+                    multi_subject_co_occurrence_clusters[idx_subject] = np.reshape(
+                        ms_rank_clusters_subject[np.reshape(multi_subject_co_occurrence_clusters[idx_subject], -1)],
+                        multi_subject_co_occurrence_clusters[idx_subject].shape)
+                    result['co_occurrence_rank_clusters_multi_subject_{}_hold_out_{}'.format(
+                        subject, held_out_block)] = multi_subject_co_occurrence_clusters[idx_subject]
+
+            if result_data is None:
+                multi_subject_arrays = np.concatenate(multi_subject_arrays, axis=0)
+                result_data, _ = _aggregate_dense(
+                    np.reshape(
+                        multi_subject_arrays,
+                        (multi_subject_arrays.shape[0] * multi_subject_arrays.shape[1], multi_subject_arrays.shape[2])),
+                    np.reshape(
+                        np.concatenate(multi_subject_co_occurrence_clusters, axis=0),
+                        (multi_subject_arrays.shape[0] * multi_subject_arrays.shape[1])),
+                    aggregation)
+
+            result['data_multi_subject_hold_out_{}'.format(held_out_block)] = result_data
 
     # convert stimuli from indices into text for convenience
     stimuli = list()
@@ -760,9 +1087,9 @@ def rank_cluster(
     for block in all_blocks:
         ea_path = os.path.join(
             element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(stimulus_subject, block))
-        ea_block = np.load(ea_path)
-        ea_stimuli = ea_block['stimuli']
-        stimuli.append(ea_stimuli[result['stimuli'][result['blocks'] == block]])
+        with np.load(ea_path) as ea_block:
+            ea_stimuli = ea_block['stimuli']
+            stimuli.append(ea_stimuli[result['stimuli'][result['blocks'] == block]])
     result['stimuli'] = np.concatenate(stimuli)
 
     # check that data we inserted is at '+'
@@ -770,6 +1097,81 @@ def rank_cluster(
         assert(result['stimuli'][idx]) == '+'
 
     result['subjects'] = all_subjects
+
+    if aggregation == 'median' or aggregation == 'counts':
+        description_aggregation_co_occurrence = \
+            """
+            Taking the median value of the properties of each event as the aggregate-event properties. The total 
+            number of events mapping to a cluster is also stored.
+            """
+        if aggregation == 'median':
+            description_aggregation_rank = \
+                """
+            Taking the median of the values of all (dipole-cluster, grid-cell) tuples which map to the same 
+            rank cluster.   
+                """
+        elif aggregation == 'counts':
+            description_aggregation_rank = \
+                """
+            Summing the counts of events from all (dipole-cluster, grid-cell) tuples which map to the same rank cluster.
+                """
+        else:
+            raise ValueError('Unknown aggregation: {}'.format(aggregation))
+    elif aggregation == 'percentile_75':
+        description_aggregation_co_occurrence = \
+            """
+            Taking the median value of the properties of each event as the aggregate-event properties. For the 
+            magnitude of the event, the 75th percentile is used rather than the median.
+            """
+        description_aggregation_rank = \
+            """
+            Taking the 75th percentile of the values of all (dipole-cluster, grid-cell) tuples which map to the same 
+            rank cluster.   
+            """
+    elif aggregation == 'L2' or aggregation == 'rms':
+        description_aggregation_co_occurrence = \
+            """
+            Taking a power-weighted average of the properties of each event as the aggregate-event properties. 
+            The L2-norm and root-mean-squared value of the absolute wavelet coefficients are also computed,
+            and the total number of events mapping to a cluster is also stored.
+            """
+        if aggregation == 'L2':
+            description_aggregation_rank = \
+                """
+            Taking the L2-norm of the values of all (dipole-cluster, grid-cell) tuples which map to the same
+            rank cluster.
+                """
+        elif aggregation == 'rms':
+            description_aggregation_rank = \
+                """
+            Taking the root of the mean of the square of the values of the aggregate-events from all 
+            (dipole-cluster, grid-cell) tuples which map to the same rank cluster.
+                """
+        else:
+            raise ValueError('Unknown aggregation: {}'.format(aggregation))
+    elif aggregation == 'mean' or aggregation == 'sum':
+        description_aggregation_co_occurrence = \
+            """
+            Taking the amplitude-weighted average of the properties of each event as the aggregate-event properties. 
+            The total absolute value and mean absolute value of the wavelet coefficients are also computed, and the 
+            total number of events mapping to a cluster is also stored.
+            """
+        if aggregation == 'sum':
+            description_aggregation_rank = \
+                """
+            Taking the sum of the values of all (dipole-cluster, grid-cell) tuples which map to the same
+            rank cluster.
+                """
+        elif aggregation == 'mean':
+            description_aggregation_rank = \
+                """
+            Taking the mean of the values of all (dipole-cluster, grid-cell) tuples which map to the same
+            rank cluster.
+                """
+        else:
+            raise ValueError('Unknown aggregation: {}'.format(aggregation))
+    else:
+        raise ValueError('Unknown aggregation: {}'.format(aggregation))
 
     result['description'] = \
         """
@@ -785,73 +1187,84 @@ def rank_cluster(
             and individual counts from which PMI is computed. Spectral clustering is applied to the
             PMI matrix to cluster the dipoles. This can roughly be thought of as clustering the dipoles according to
             phase-locking value, i.e. this is an approximation to clustering by functional connectivity. The events 
-            (maxima) within a dipole cluster are then combined together within each grid-cell, epoch tuple. When 
-            multiple events occur within the same grid-cell, they are aggregated according to one of three rules.
-                In harry_potter_rank_clustered.npz the magnitude is computed as the L2-norm of the events,
-                    and other properties of the events are combined using the power-weighted average.
-                In harry_potter_rank_clustered_median.npz the properties of the aggregate events are the medians
-                    of each property
-                In harry_potter_rank_clustered_counts.npz the number of events comprising each cluster is used
-                    to represent each cluster
-        4. A matrix is formed which has on one axis each dipole-cluster, grid-cell tuple, and on the other axis each
-            epoch. The epochs are ranked within a dipole-cluster, and k-means is applied using as the samples the 
-            (dipole-cluster, grid-cell) axis and as feature the epoch ranking (actually a
-            variant of k-means which can handle missing data). This gives a new clustering, which groups together 
+            (maxima) within a dipole-cluster are then combined together within each (grid-cell, epoch) tuple. Events
+            are aggregated within a (dipole-cluster, grid_cell, epoch) according to the specified aggregation type. In
+            the case of {aggregation} aggregation, which has been used for the current results, events are combined by:
+        """.format(aggregation=aggregation) \
+        + description_aggregation_co_occurrence + \
+        """
+        4. A matrix is formed which has on one axis each (dipole-cluster, grid-cell) tuple, and on the other axis each
+            epoch. The epochs are ranked within a (dipole-cluster, grid-cell) tuple, and Kendall's tau-b is computed 
+            between each (dipole-cluster, grid-cell) tuple and each other (dipole-cluster, grid-cell) tuple, to produce
+            a matrix of rank-correlations. The rank-correlations are then converted to an affinity matrix, and spectral
+            clustering is on these rank-correlations to produce a new clustering, which groups together 
             similar (dipole-cluster, grid-cell) tuples where similarity is defined as their ranking of the epochs.
-            We call these rank-clusters. Events occurring within the same rank cluster are again aggregated together.
-            For each epoch (word) using the same aggregation as described in step 3, this gives us num_rank_cluster 
-            values as the final data.
-            
+            We call these rank-clusters. Aggregate-events from the co-occurrence clustering step which occurring within 
+            the same rank cluster are then further aggregated together according to the specified aggregation type. In
+            the case of {aggregation} aggregation, which has been used for the current results, the final representation
+            of an epoch (word) for a cluster is given by:
+        """.format(aggregation=aggregation) \
+        + description_aggregation_rank + \
+        """
+            This gives us num_rank_cluster values as the final data. Joint clustering over all subjects is also applied
+            at this step, and proceeds in a similar manner. However, under typical parameters of the computation, the
+            total number of (dipole-cluster, grid-cell) tuples across all subjects becomes too large for direct spectral
+            clustering. Instead, a hierarchical clustering is employed. First, within-subject clusters are computed
+            as described above (but note that the number of single-subject clusters for hierarchical clustering may
+            be more than the number of single-subject clusters used for independent clustering), and the data resulting
+            from the single-subject clustering is then clustered across subjects, again by using an affinity matrix
+            computed using Kendall's tau and applying spectral clustering to this matrix. The final data from the joint 
+            clustering is aggregated directly from the (dipole-cluster, grid-cell) tuple aggregates resulting 
+            from step 3 (i.e. the intermediate result of the hierarchical clustering is discarded).
+        
         The code which produces this data can be found at 
         https://github.com/danrsc/analytic_wavelet_meg and https://github.com/danrsc/analytic_wavelet
         
         Note that all fields in this file of the form *_<subject>_hold_out_<held-out-block> contain information
         for one subject where the values were computed with the appropriate block held out of all training steps 
-        (the PMI is computed without this block for the spectral clustering, and the k-means is computed without this
-        block for the rank clustering).
+        (the PMI is computed without this block for the spectral clustering, and the Kendall's tau is computed without 
+        this block for the rank clustering).
         
         Fields:
             description: Comments about what this data file contains.
-            grid: The boundaries of the grid elements. A 2d array with shape (num_grid_elements, 4) giving 
-                (low-time, high-time, low-freq, high-freq) coordinates for each grid-element. The high-time 
+            grid: The boundaries of the grid elements. A 2d array with shape (num_grid_cells, 4) giving 
+                (low-time, high-time, low-freq, high-freq) coordinates for each grid-cell. The high-time 
                 and high-freq boundaries are exclusive, the low-time and low-freq boundaries are inclusive. 
-                Grid-elements at the lowest-frequency have an open-lower bound, meaning events which fall below the
+                Grid-cells at the lowest-frequency have an open-lower bound, meaning events which fall below the
                 lowest-frequency are put into the lowest frequency bins at the same time interval. Similarly, events
                 which occur at a higher frequency than the highest frequency bins are put into the highest frequency
                 bins at the same time interval.
             stimuli: The text of the stimulus corresponding to each row of data_<subject>_hold_out_<held-out-block>
             blocks: The block corresponding to each row of data_<subject>_hold_out_<held-out-block>
-            spectral_source_clusters_<subject>_hold_out_<held-out-block>:
-                The spectral cluster assignment for each source (dipole).
-                A 1d array with shape (num_sources,)
+            co_occurrence_clusters_<subject>_hold_out_<held-out-block>:
+                The co-occurrence cluster assignment for each source. Spatial clustering only (copied from input data).
+                A 1d array with shape (num_sources,). This is the result of step 3 above.
             source_rank_clusters_<subject>_hold_out_<held-out-block>: The rank-cluster assignment for each
-                (source, grid-element) tuple. A 2d array with shape (num_sources, num_grid_elements)
-            spectral_rank_clusters_<subject>_hold_out_<held-out-block>: The rank-cluster assignment for each
-                (spectral_cluster, grid-element) tuple. A 2d array with shape (num_spectral_clusters, num_grid_elements)
-            rank_cluster_centroids_<subject>_hold_out_<held-out-block>: The centroids for each rank-cluster.
-                A 2d array of shape (num_rank_clusters, num_train_epochs)
+                (source, grid-cell) tuple. A 2d array with shape (num_sources, num_grid_cells)
+            co_occurrence_rank_clusters_<subject>_hold_out_<held-out-block>: The rank-cluster assignment for each
+                (co_occurrence_cluster, grid-cell) tuple. 
+                A 2d array with shape (num_co_occurrence_clusters, num_grid_cells)
             data_<subject>_hold_out_<held-out-block>:
-                The L2 norm (or median, when mode='median', or counts when mode='counts') of the input magnitudes for 
-                each cluster. A 2d array  with shape (num_stimuli, n_clusters). Note that this contains data for all 
+                The aggregate values for each cluster, computed as described in steps 3 and 4 above. 
+                A 2d array with shape (num_stimuli, n_clusters). Note that this contains data for all 
                 blocks, but the clustering is fit without the held out block.
             source_rank_clusters_multi_subject_<subject>_hold_out_<held-out-block>:
                 Similar to source_rank_clusters_<subject>_hold_out_<held-out-block>, but contains the cluster 
                 assignments when all of the subjects are clustered jointly. These are still separated out by subject
                 even in the multi-subject clustering case
-            spectral_rank_clusters_multi_subject_<subject>_hold_out_<held-out-block>: 
+            co_occurrence_rank_clusters_multi_subject_<subject>_hold_out_<held-out-block>: 
                 Similar to spectral_rank_clusters_<subject>_hold_out_<held-out-block>, but contains the cluster
                 assignments when all of the subjects are clustered jointly. These are still separated out by subject
                 even in the multi-subject clustering case
-            rank_cluster_centroids_multi_subject_hold_out_<held-out-block>: The centroids for each rank-cluster when
-                all of the subjects are clustered jointly.
             data_multi_subject_hold_out_<held-out-block>: 
-                The L2 norm (or median, when mode='median', or counts when mode='counts') of the input magnitudes for 
-                each cluster when the subjects are clustered jointly. A 2d array with shape (num_stimuli, n_clusters). 
-                Note that this contains data for all blocks, but the clustering is fit without the held out block.
+                The aggregate values for each cluster when the subjects are clustered jointly. 
+                A 2d array with shape (num_stimuli, n_clusters). Note that this contains data for all blocks, 
+                but the clustering is fit without the held out block.
         """
 
-    output_name = 'harry_potter_rank_clustered{}{}.npz'.format(
-        '' if method == 'k_pod' else '_' + method,
-        '' if aggregation == 'L2' else '_' + aggregation)
+    output_name = 'harry_potter_meg_rank_clustered_{aggregation}{time_slice}{single_subject}.npz'.format(
+        aggregation=aggregation,
+        time_slice='' if time_slice_ms is None else '_time_slice_ms_{}'.format(time_slice_ms),
+        single_subject='' if single_subject is None else '_' + single_subject)
 
     np.savez(os.path.join(element_analysis_dir, output_name), **result)

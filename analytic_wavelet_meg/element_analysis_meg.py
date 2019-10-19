@@ -3,7 +3,6 @@ from itertools import repeat
 from datetime import datetime
 import numpy as np
 from numba import njit, prange
-from bottleneck import median, nanmin
 from scipy.fftpack import next_fast_len
 from scipy.signal import detrend
 import mne
@@ -22,7 +21,6 @@ __all__ = [
     'cumulative_indices_from_unique_inverse',
     'segment_combine_events',
     'segment_median',
-    'k_pod',
     'kendall_tau']
 
 
@@ -461,36 +459,6 @@ def cumulative_indices_from_unique_inverse(inverse, counts):
     return result[indices_sort]
 
 
-def _vertex_label_count(vertex_label):
-    vertex_label, counts = np.unique(vertex_label, axis=0, return_counts=True)
-    unique_labels, label_id = np.unique(vertex_label[:, 1:], return_inverse=True, axis=0)
-    unique_vertices, vertex_id = np.unique(vertex_label[:, 0], return_inverse=True)
-
-    # put counts in a dense representation that is addressable by vertex and label
-    counts_ = np.zeros((len(unique_labels), len(unique_vertices)), counts.dtype)
-    counts_[(label_id, vertex_id)] = counts
-    return unique_labels, unique_vertices, counts_
-
-
-def _vertex_label_count_from_flat_indices(flat_indices, shape, vertex_axis, label_axes):
-    indices = np.unravel_index(flat_indices, shape)
-    if not np.isscalar(label_axes):
-        vertex_label = [indices[vertex_axis]] + list(np.expand_dims(indices[ax], 1) for ax in label_axes)
-    else:
-        vertex_label = [indices[vertex_axis], indices[label_axes]]
-
-    vertex_label = np.concatenate(list(np.expand_dims(ind, 1) for ind in vertex_label), axis=1)
-
-    vertex_label, counts = np.unique(vertex_label, axis=0, return_counts=True)
-    unique_labels, label_id = np.unique(vertex_label[:, 1:], return_inverse=True, axis=0)
-    unique_vertices, vertex_id = np.unique(vertex_label[:, 0], return_inverse=True)
-
-    # put counts in a dense representation that is addressable by vertex and label
-    counts_ = np.zeros((len(unique_labels), len(unique_vertices)), counts.dtype)
-    counts_[(label_id, vertex_id)] = counts
-    return unique_labels, unique_vertices, counts_
-
-
 @njit(parallel=True)
 def _numba_sum_min(x):
 
@@ -521,48 +489,81 @@ def _numba_sum_min(x):
     return final_result
 
 
+@njit(parallel=True)
+def _parallel_quantile(v, q, bounds):
+    m = np.full(len(bounds), np.nan, dtype=np.float64)
+    for i in prange(len(bounds)):
+        if q is None:
+            m[i] = np.median(v[bounds[i][0]:bounds[i][1]])
+        else:
+            m[i] = np.quantile(v[bounds[i][0]:bounds[i][1]])
+    return m
+
+
 def segment_median(segment_labels, *values, min_count=None):
-    unique_segment_labels, segment_labels, counts = np.unique(
-        segment_labels, axis=0, return_inverse=True, return_counts=True)
 
-    indicator_good_segment = None
+    segment_label_encoder_shape = None
+    if isinstance(segment_labels, (tuple, list)):
+        segment_label_encoder_shape = tuple(np.max(lbl) + 1 for lbl in segment_labels)
+        segment_labels = np.ravel_multi_index(segment_labels, segment_label_encoder_shape)
+
+    segment_labels, inverse, indices_sort = _numba_unique(segment_labels)
+    counts = _numba_bincount(inverse)
+
+    if segment_label_encoder_shape is not None:
+        segment_labels = np.unravel_index(segment_labels, segment_label_encoder_shape)
+
+    values = [(v[0][indices_sort], v[1])
+              if (isinstance(v, (tuple, list)) and len(v) == 2) else v[indices_sort] for v in values]
+    bounds = np.concatenate([np.array([0]), _numba_cumsum(counts)])
+    bounds = np.concatenate([np.expand_dims(bounds[:-1], 1), np.expand_dims(bounds[1:], 1)], axis=1)
     if min_count is not None:
-        indicator_enough = counts >= min_count
-        new_unique_order = np.full_like(counts, -1)
-        new_unique_order[indicator_enough] = np.arange(np.count_nonzero(indicator_enough))
-        segment_labels = new_unique_order[segment_labels]
-        unique_segment_labels = unique_segment_labels[indicator_enough]
-        indicator_good_segment = segment_labels >= 0
-        segment_labels = segment_labels[indicator_good_segment]
-        counts = counts[indicator_enough]
-        del indicator_enough
-
-    splits = np.cumsum(counts)[:-1]
-    indices_sort = np.argsort(segment_labels)
-    result = [unique_segment_labels, counts]
+        bounds = bounds[counts >= min_count]
+    result = [segment_labels, counts]
     for v in values:
-        if indicator_good_segment is not None:
-            v = v[indicator_good_segment]
-        assert(len(v) == len(indices_sort))
-        v = v[indices_sort]
-        for idx, item in enumerate(np.split(v, splits)):
-            m = median(item)
-            if idx == 0:
-                result.append(np.full(len(unique_segment_labels), np.nan, dtype=type(m)))
-            result[-1][idx] = m
+        if isinstance(v, (tuple, list)):
+            v, q = v
+            result.append(_parallel_quantile(v, q, bounds))
+        else:
+            result.append(_parallel_quantile(v, None, bounds))
+
     return tuple(result)
 
 
-def segment_combine_events(segment_labels, c_hat, min_count=None, power_weighted_dict=None, unweighted_dict=None):
+@njit
+def _numba_unique(x):
+    indices_sort = np.argsort(x)
+    x = x[indices_sort]
+    inverse = np.zeros_like(indices_sort)
+    indicator_keep = np.full(len(indices_sort), False)
+    indicator_keep[0] = True
+    for i in range(1, len(inverse)):
+        if x[i] != x[i - 1]:
+            inverse[indices_sort[i]] = inverse[indices_sort[i - 1]] + 1
+            indicator_keep[i] = True
+        else:
+            inverse[indices_sort[i]] = inverse[indices_sort[i - 1]]
+    return x[indicator_keep], inverse, indices_sort
+
+
+def _unsorted_segment_sum(segment_labels, *x):
+    segment_labels, inverse, _ = _numba_unique(segment_labels)
+    return (segment_labels,) + tuple(_numba_bincount(inverse, x_) for x_ in x)
+
+
+def segment_combine_events(
+        segment_labels, c_hat, min_count=None, power_weighted_dict=None, unweighted_dict=None, use_amplitude=False):
     """
     Combines events together according to segment_labels. The result will have 1 event per unique segment label
     Args:
-        segment_labels: A 1d or 2d array giving the "segments" for each event. This would typically be something like
+        segment_labels: A 1d array or tuple giving the "segments" for each event. This would typically be something like
             (epoch, combined-source, grid-label) for each event. The number of events is along axis=0
         c_hat: The estimated complex coefficient for each event. This will be used to compute the power for
             power-weighted combinations, and will also be used to compute the magnitude of the combined event
         min_count: If not None, then unique segment_labels having fewer than this many instances will be dropped from
             the data
+        use_amplitude: If True, items in power_weighted dict are weighted by abs(c_hat) rather than abs(c_hat)**2 and
+            modulus is mean(abs(c_hat)) rather than L2
         power_weighted_dict: Each item in the dictionary should be a 1d array which will be combined according to
             segment_labels by using a weighted average within label, weighted by the power at each point
             (the power is computed from c_hat)
@@ -572,273 +573,152 @@ def segment_combine_events(segment_labels, c_hat, min_count=None, power_weighted
     Returns:
         unique_segment_labels: An array of the unique segment labels
         counts: The number of events in each unique segment
-        modulus: The L2 norm of of the modulus of c_hat within label
+        modulus: The L2 norm of of the modulus of c_hat within label (or sum of the modulus if use_amplitude=True)
+        modulus_rms: The rms of the modulus of c_hat within label (or mean of the modulus if use_amplitude=True)
         power_weighted_result: A dictionary having the same keys as power_weighted_dict, containing the
             weighted averages of each item from power_weighted_dict within label. Only returned if power_weighted_dict
             is not None
         unweighted_result: A dictionary having the same keys as unweighted_dict, containing the averages of each item
             from unweighted_dict within label. Only returned if unweighted_dict is not None
     """
-    unique_segment_labels, segment_labels, counts = np.unique(
-        segment_labels, axis=0, return_inverse=True, return_counts=True)
 
-    indicator_good_segment = None
+    segment_label_encoder_shape = None
+    if isinstance(segment_labels, (tuple, list)):
+        segment_label_encoder_shape = tuple(np.max(lbl) + 1 for lbl in segment_labels)
+        segment_labels = np.ravel_multi_index(segment_labels, segment_label_encoder_shape)
+
+    if len(segment_labels) != len(c_hat):
+        raise ValueError('The number of segment_labels must be the same as the number of items in c_hat')
+
+    if c_hat.ndim != 1:
+        raise ValueError('c_hat must be 1d')
+
+    if use_amplitude:
+        w = np.abs(c_hat)
+    else:
+        w = np.square(np.abs(c_hat))
+
+    x = [w, np.ones_like(w)]
+    if power_weighted_dict is not None:
+        for k in power_weighted_dict:
+            if not np.array_equal(power_weighted_dict[k].shape, c_hat.shape):
+                raise ValueError('power_weighted_dict[{}] has a different shape than c_hat'.format(k))
+            x.append(w * power_weighted_dict[k])
+    if unweighted_dict is not None:
+        for k in unweighted_dict:
+            if not np.array_equal(unweighted_dict[k].shape, c_hat.shape):
+                raise ValueError('unweighted_dict[{}] has a different shape than c_hat'.format(k))
+            x.append(unweighted_dict[k])
+
+    x = _unsorted_segment_sum(segment_labels, *x)
+    segment_labels = x[0]
+    x = list(x[1:])
+
+    counts = x[1]
     if min_count is not None:
         indicator_enough = counts >= min_count
-        new_unique_order = np.full_like(counts, -1)
-        new_unique_order[indicator_enough] = np.arange(np.count_nonzero(indicator_enough))
-        segment_labels = new_unique_order[segment_labels]
-        unique_segment_labels = unique_segment_labels[indicator_enough]
-        indicator_good_segment = segment_labels >= 0
-        segment_labels = segment_labels[indicator_good_segment]
+        for i in range(len(x)):
+            x[i] = x[i][indicator_enough]
         counts = counts[indicator_enough]
-        del indicator_enough
+        segment_labels = segment_labels[indicator_enough]
 
-    indices_sort = np.argsort(segment_labels)
-    segment_labels = segment_labels[indices_sort]
+    if segment_label_encoder_shape is not None:
+        segment_labels = np.unravel_index(segment_labels, segment_label_encoder_shape)
 
-    if indicator_good_segment is not None:
-        c_hat = c_hat[indicator_good_segment]
+    w = x[0]
 
-    assert (len(c_hat) == len(indices_sort))
-    w = np.square(np.abs(c_hat[indices_sort]))
-    total_w = np.bincount(segment_labels, weights=w)
-    assert (len(total_w) == len(unique_segment_labels))
+    offset = 2
 
     power_weighted_result = None
     if power_weighted_dict is not None:
         power_weighted_result = type(power_weighted_dict)()
-        for k in power_weighted_dict:
-            v = power_weighted_dict[k]
-            if indicator_good_segment is not None:
-                v = v[indicator_good_segment]
-            assert(len(v) == len(indices_sort))
-            power_weighted_result[k] = (
-                np.bincount(segment_labels, weights=v[indices_sort] * w) / total_w)
-
-    total_segment = np.bincount(segment_labels)
-    l2 = np.sqrt(total_w)
-    rms = np.sqrt(total_w / total_segment)
+        for i, k in enumerate(power_weighted_dict):
+            power_weighted_result[k] = x[i + offset] / w
+        offset += len(power_weighted_dict)
 
     unweighted_result = None
     if unweighted_dict is not None:
         unweighted_result = type(unweighted_dict)()
-        for k in unweighted_dict:
-            v = unweighted_dict[k]
-            if indicator_good_segment is not None:
-                v = v[indicator_good_segment]
-            assert(len(v) == len(indices_sort))
-            unweighted_result[k] = np.bincount(segment_labels, weights=v[indices_sort])
+        for i, k in enumerate(unweighted_dict):
+            unweighted_result[k] = x[i + offset]
+        offset += len(unweighted_dict)
+
+    if use_amplitude:
+        total = w
+        avg = w / counts
+    else:
+        total = np.sqrt(w)
+        avg = np.sqrt(w / counts)
 
     if power_weighted_dict is not None and unweighted_dict is not None:
-        return unique_segment_labels, counts, l2, rms, power_weighted_result, unweighted_result
+        return segment_labels, counts, total, avg, power_weighted_result, unweighted_result
     if power_weighted_dict is not None:
-        return unique_segment_labels, counts, l2, rms, power_weighted_result
+        return segment_labels, counts, total, avg, power_weighted_result
     if unweighted_dict is not None:
-        return unique_segment_labels, counts, l2, rms, unweighted_result
-    return unique_segment_labels, counts, l2, rms
+        return segment_labels, counts, total, avg, unweighted_result
+    return segment_labels, counts, total, avg
 
 
-def common_label_count(vertices, labels, batch_size=100000):
+@njit
+def _numba_bincount(bins, weights=None):
+    return np.bincount(bins, weights)
+
+
+@njit
+def _numba_cumsum(x):
+    return np.cumsum(x)
+
+
+def common_label_count(indices_source, indices_label, weights=None):
     """
     For every pair of vertices v1 and v2, computes: sum_label(min(count v1 in label, count v2 in label))
     Args:
-        vertices: The vertices for every sample (1d)
-        labels: The labels for every sample (vertices.shape[0], ...)
-        batch_size: If given, counting is done in parallel over batches
+        indices_source: The vertices for every sample (1d)
+        indices_label: The labels for every sample (1d)
+        weights: If not None, the counts are weighted by these values
     Returns:
         A 2d array of shape (len(np.unique(vertices)), len(np.unique(vertices))) giving the number of common points
     """
-
-    if labels.ndim == 1:
-        labels = np.expand_dims(labels, 1)
-
-    # unique is pretty slow if we run it on the number of points we expect, so we multi-thread it
-    vertex_label = np.concatenate([np.expand_dims(vertices, 1), labels], axis=1)
-    if batch_size is None:
-        unique_labels, unique_vertices, counts = _vertex_label_count(vertex_label)
-    else:
-        unique_vertices = list()
-        unique_labels = list()
-        counts = list()
-        with ProcessPoolExecutor() as ex:
-            num_splits = int(np.ceil(len(vertex_label) / batch_size))
-            for current_labels, current_vertices, current_counts in ex.map(
-                    _vertex_label_count, np.array_split(vertex_label, num_splits)):
-                unique_vertices.append(current_vertices)
-                unique_labels.append(current_labels)
-                counts.append(current_counts)
-
-        splits_vertices = np.cumsum(list(len(v) for v in unique_vertices))[:-1]
-        splits_labels = np.cumsum(list(len(l_) for l_ in unique_labels))[:-1]
-        unique_vertices = np.concatenate(unique_vertices)
-        unique_labels = np.concatenate(unique_labels)
-
-        unique_vertices, destination_vertices = np.unique(unique_vertices, return_inverse=True)
-        unique_labels, destination_labels = np.unique(unique_labels, return_inverse=True, axis=0)
-
-        destination_vertices = np.split(destination_vertices, splits_vertices)
-        destination_labels = np.split(destination_labels, splits_labels)
-
-        batch_counts = counts
-        counts = np.zeros((len(unique_labels), len(unique_vertices)), batch_counts[0].dtype)
-
-        for map_labels, map_vertices, source_counts in zip(destination_labels, destination_vertices, batch_counts):
-            map_labels, map_vertices = np.meshgrid(map_labels, map_vertices, indexing='ij')
-            counts[(np.reshape(map_labels, -1), np.reshape(map_vertices, -1))] += np.reshape(source_counts, -1)
+    num_labels = np.max(indices_label) + 1
+    num_sources = np.max(indices_source) + 1
+    counts = _numba_bincount(
+        np.ravel_multi_index((indices_label, indices_source), (num_labels, num_sources)), weights=weights)
+    if len(counts) < num_labels * num_sources:
+        counts_ = np.zeros(num_labels * num_sources, dtype=counts.dtype)
+        counts_[:len(counts)] = counts
+        counts = counts_
+    counts = np.reshape(counts, (num_labels, num_sources))
 
     # sum out the labels to give a count per-source. This can be useful
     # if we decide to use something like pointwise-mutual information
     # downstream
-    independent_counts = np.sum(counts, axis=0)
+    independent_counts = np.sum(counts, axis=0, dtype=np.int64)
 
     # note: this step takes 1 - 4 hours for a full block on the GPU servers
     # You need to have a lot of memory to run this, it uses about 80GB
     joint_counts = _numba_sum_min(counts)
 
-    return unique_vertices, unique_labels, joint_counts, independent_counts
+    return joint_counts, independent_counts
 
 
-def k_pod(x, use_mini_batch=False, max_k_pod_iter=10, **k_means_kwargs):
-    """
-    Runs k-means clustering on data with missing values
-
-    Based on the algorithm from:
-    Chi, Jocelyn T., Eric C. Chi, and Richard G. Baraniuk.
-    "k-pod: A method for k-means clustering of missing data." The American Statistician 70, no. 1 (2016): 91-99.
-
-    Args:
-        x: The data to cluster (n_samples, n_features)
-        use_mini_batch: If True, MiniBatchKMeans is used internally instead of KMeans
-        max_k_pod_iter: The maximum number of outer-iterations of the algorithm
-        **k_means_kwargs: Arguments to sklearn.cluster.KMeans
-
-    Returns:
-        labels: The clusters for each sample. 1d array of length n_samples
-        cluster-centers: The cluster centers for each cluster
-        x: A copy of the input data with missing data replaced by cluster-center values
-    """
-    from sklearn.cluster import KMeans, MiniBatchKMeans
-
-    if max_k_pod_iter < 1:
-        raise ValueError('Need at least one iteration. max_k_pod_iter: {}'.format(max_k_pod_iter))
-
-    indicator_nan = np.isnan(x)
-    indicator_all_nan = np.all(indicator_nan, axis=0, keepdims=True)
-    x = np.where(indicator_all_nan, 0, x)
-    x = np.where(indicator_nan, np.nanmean(x, axis=0, keepdims=True), x)
-
-    previous_labels = None
-    k_means = None
-    for i in range(max_k_pod_iter):
-        k_means = MiniBatchKMeans(**k_means_kwargs) if use_mini_batch else KMeans(**k_means_kwargs)
-        labels = k_means.fit_predict(x)
-        # fill in the missing values based on their cluster centroids
-        x = np.where(indicator_nan, k_means.cluster_centers_[labels], x)
-
-        if previous_labels is not None and np.all(labels == previous_labels):
-            break
-
-        k_means_kwargs['init'] = k_means.cluster_centers_
-        k_means_kwargs['n_init'] = 1
-        previous_labels = labels
-
-    x = np.where(indicator_all_nan, np.nan, x)
-    cluster_centers = np.where(indicator_all_nan, np.nan, k_means.cluster_centers_)
-
-    return previous_labels, cluster_centers, x
-
-
-@njit(parallel=True)
-def _numba_concordant_discordant(z, indices_sort, indicator_valid):
-    count = (z.shape[0] * (z.shape[0] + 1)) // 2
-    c = np.zeros(count, dtype=np.int64)
-    d = np.zeros_like(c)
-
-    for k in prange(z.shape[1] - 1):
-        k_c = np.zeros(count, dtype=np.int64)
-        k_d = np.zeros_like(k_c)
-        for m in range(k + 1, z.shape[1]):
-            i_xy = 0
-            for i_x in range(z.shape[0]):
-                k_s = indices_sort[i_x, k]
-                m_s = indices_sort[i_x, m]
-                if not indicator_valid[i_x, m_s] or not indicator_valid[i_x, k_s] or z[i_x, m_s] == z[i_x, k_s]:
-                    i_xy += z.shape[0] - i_x
-                    continue
-                # z[i_x, m_s] > z[i_x, k_s] because we are using indices_sort
-                for i_y in range(i_x, z.shape[0]):
-                    if indicator_valid[i_y, k_s] and indicator_valid[i_y, m_s]:
-                        if z[i_y, m_s] > z[i_y, k_s]:
-                            c[i_xy] += 1
-                        elif z[i_y, m_s] < z[i_y, k_s]:
-                            d[i_xy] += 1
-                    i_xy += 1
-        c += k_c
-        d += k_d
-
-    final_c = np.zeros((z.shape[0], z.shape[0]), c.dtype)
-    final_d = np.zeros_like(final_c)
-    i_xy = 0
-    for i_x in range(z.shape[0]):
-        for i_y in range(i_x, z.shape[0]):
-            final_c[i_x, i_y] = c[i_xy]
-            final_c[i_y, i_x] = c[i_xy]
-            final_d[i_x, i_y] = d[i_xy]
-            final_d[i_y, i_x] = d[i_xy]
-            i_xy += 1
-
-    return final_c, final_d
-
-
-def kendall_tau_old(x):
-    # copied from https://github.com/scipy/scipy/blob/v1.3.1/scipy/stats/mstats_basic.py#L534-L663
-    # and modified (actually pretty much rewritten) to run on the rows of a matrix
-    indicator_valid = np.logical_not(np.isnan(x))
-    indices_sort = np.argsort(x, axis=1)
-    c, d = _numba_concordant_discordant(x, indices_sort, indicator_valid)
-
-    tie_corrections = np.zeros(len(x))
-    # replace nan for unique
-    sentinel = nanmin(x) - 1
-    x = np.where(indicator_valid, x, sentinel)
-    # attach the row
-    rows = np.tile(np.reshape(np.arange(len(x)), (len(x), 1, 1)), (1, x.shape[1], 1))
-    x = np.reshape(np.concatenate([np.expand_dims(x, 2), rows], axis=2), (-1, 2))
-    x, counts = np.unique(x, axis=0, return_counts=True)
-    indicator_keep = np.logical_and(x[:, 0] > sentinel, counts > 1)
-    x = x[indicator_keep]
-    counts = counts[indicator_keep]
-    for row in np.unique(x[:, 1]):
-        row_counts = counts[x[:, 1] == row]
-        tie_corrections[row] = np.sum(row_counts * (row_counts - 1))
-
-    num_common = np.count_nonzero(
-        np.logical_and(np.expand_dims(indicator_valid, 0), np.expand_dims(indicator_valid, 1)), axis=2)
-    denominator = num_common * (num_common - 1)
-    denominator = np.sqrt(
-        ((denominator - np.expand_dims(tie_corrections, 0)) / 2)
-        * ((denominator - np.expand_dims(tie_corrections, 1)) / 2))
-
-    return np.clip((c - d) / denominator, a_min=-1, a_max=1), num_common
-
-
-def kendall_tau(a):
+def kendall_tau(x):
     """
     Computes tau-b (i.e. corrects for ties) pairwise for each pair of rows in a, omitting pairs of values where either
     value is nan (same as scipy.stats.kendalltau with nan_policy='omit').
     This is a very fast implementation of Kendall's tau which uses Knight's algorithm and runs in parallel across
-    each pair of rows in a. The core algorithm is JIT-compiled using numba. This runs hundreds of times faster
+    each pair of rows in x. The core algorithm is JIT-compiled using numba. This runs hundreds of times faster
     than scipy's implementation.
     Args:
-        a: A 2d array of shape (num_variables, num_samples_per_variable)
+        x: A 2d array of shape (num_variables, num_samples_per_variable) containing ranked data.
+            nan is handled by omitting any pair (x[i, k], x[j, k]) from the computation of tau_b(x[i], x[j])
+            when either x[i, k] or x[j, k] is nan
 
     Returns:
-        tau: A 2d array of shape (num_variables, num_variables) containing where tau[i, j] = tau_b(a[i], a[j])
+        tau: A 2d array of shape (num_variables, num_variables) containing where tau[i, j] = tau_b(x[i], x[j])
         num_common: A 2d array of shape (num_variables, num_variables) where num_common[i, j] gives how many samples
-            were actually used in the computation (i.e. a.shape[1] - num_omitted(i, j))
+            were actually used in the computation (i.e. x.shape[1] - num_omitted(i, j))
     """
-    tau, num_common = _kendall_tau(a)
+    tau, num_common = _kendall_tau(x)
     clipped = np.clip(tau, a_min=-1, a_max=1)
     assert(np.allclose(clipped, tau, equal_nan=True))
     return clipped, num_common
@@ -846,7 +726,7 @@ def kendall_tau(a):
 
 @njit(parallel=True)
 def _kendall_tau(a):
-    # primarily ported from the c code at https://github.com/fruttasecca/kendall/blob/master/include/kendall.h#L103
+    # primarily ported from the C++ code at https://github.com/fruttasecca/kendall/blob/master/include/kendall.h
     # see also https://en.wikipedia.org/wiki/Kendall_rank_correlation_coefficient which describes the algorithm
 
     result = np.full((a.shape[0], a.shape[0]), np.nan, dtype=a.dtype)
@@ -880,16 +760,17 @@ def _kendall_tau(a):
         x = x[indices_sort]
         y = y[indices_sort]
 
-        # stable-sort by 'x', now we've sorted by x then y
+        # stable-sort by x, now the sort order is keyed by x then y
         indices_sort = np.argsort(x, kind='mergesort')
-
         x = x[indices_sort]
         y = y[indices_sort]
 
-        same_x = 0  # total pairs with same x
-        same_xy = 0  # total pairs with same xy
-        consecutive_same_x = 1  # current streak of pairs with same x
-        consecutive_same_xy = 1  # current streak of pairs with same xy
+        # n_1: sum_i((t_i * (t_i - 1)) // 2) where t_i is the number of tied values in the ith group of ties for x
+        same_x = 0
+        # n_3: computed like n_1, but where t_i is the number of tied values jointly in the ith group of ties for x, y
+        same_xy = 0
+        consecutive_same_x = 1  # t_i in n_1: current streak of ties in x
+        consecutive_same_xy = 1  # t_i in n_3: current streak of pairs with same x, y
 
         for j in range(1, len(x)):
             if x[j] == x[j - 1]:
@@ -963,8 +844,9 @@ def _kendall_tau(a):
             y, holder = holder, y
             chunk *= 2
 
+        # n_2: sum_i((t_i * (t_i - 1)) // 2) where t_i is the number of tied values in the ith group of ties for y
         same_y = 0
-        consecutive_same_y = 1
+        consecutive_same_y = 1  # t_i in n_2
         for j in range(1, len(y)):
             if y[j] == y[j - 1]:
                 consecutive_same_y += 1
