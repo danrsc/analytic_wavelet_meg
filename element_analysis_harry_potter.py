@@ -1,5 +1,6 @@
 import os
 import gc
+from datetime import datetime
 import numpy as np
 from sklearn.cluster import SpectralClustering
 from bottleneck import nanrankdata, nanmedian, nansum, nanmean
@@ -9,7 +10,10 @@ from tqdm.auto import tqdm
 
 from analytic_wavelet import ElementAnalysisMorse
 from analytic_wavelet_meg import radians_per_ms_from_hertz, PValueFilterFn, maxima_of_transform_mne_source_estimate, \
-    make_grid, assign_grid_labels, common_label_count, segment_combine_events, segment_median, kendall_tau
+    make_grid, assign_grid_labels, common_label_count, kendall_tau, segment_median, segment_combine_events
+
+all_blocks = 1, 2, 3, 4
+all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
 
 
 def load_harry_potter(subject, block):
@@ -103,7 +107,7 @@ def make_element_analysis_block(output_path, load_fn, subject, block, label_name
         right_vertices=vertices[1])
 
 
-def _compute_shared_grid_element_counts(ea_path, time_slice_ms=None, weight_kind=None):
+def _local_thread_compute_shared_grid_element_counts(result_queue, ea_path, time_slice_ms, weight_kind, index_slice):
     with np.load(ea_path) as ea_block:
         ea_morse = ElementAnalysisMorse(ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
         c_hat, _, f_hat = ea_morse.event_parameters(
@@ -114,61 +118,85 @@ def _compute_shared_grid_element_counts(ea_path, time_slice_ms=None, weight_kind
         indices_stimuli, indices_source, _, indices_time = np.unravel_index(
             ea_block['indices_flat'], ea_block['shape'])
 
-        has_slices = True
-        if time_slice_ms is None:
-            has_slices = False
-            time_slice_ms = ea_block['shape'][-1]
-
-        if ea_block['shape'][-1] // time_slice_ms * time_slice_ms != ea_block['shape'][-1]:
-            raise ValueError('time_slice_ms must divide epochs exactly. Epoch has {} ms, time_slice_ms is {}'.format(
-                ea_block['shape'][-1], time_slice_ms))
-
         # noinspection PyTypeChecker
         grid = make_grid(ea_morse, time_slice_ms, scale_frequencies[np.arange(0, len(scale_frequencies), 10)])
 
-        num_slices = ea_block['shape'][-1] // time_slice_ms
+        indices_time_slice = indices_time - index_slice * time_slice_ms
+        indicator_slice = np.logical_and(indices_time_slice >= 0, indices_time_slice < time_slice_ms)
+        grid_labels = assign_grid_labels(grid, indices_time_slice[indicator_slice], f_hat[indicator_slice])
 
-        joint_count = list()
-        independent_count = list()
-        grid_labels = list()
+        # flatten this index to save some memory
+        combine_source_labels = np.ravel_multi_index(
+            (indices_stimuli[indicator_slice], grid_labels), (ea_block['shape'][0], len(grid)))
 
-        for index_slice in range(num_slices):
-            indices_time_slice = indices_time - index_slice * time_slice_ms
-            indicator_slice = np.logical_and(indices_time_slice >= 0, indices_time_slice < time_slice_ms)
-            slice_grid_labels = assign_grid_labels(grid, indices_time_slice[indicator_slice], f_hat[indicator_slice])
+        weights = None
+        if weight_kind == 'power':
+            weights = np.square(np.abs(c_hat[indicator_slice]))
+        elif weight_kind == 'amplitude':
+            weights = np.abs(c_hat[indicator_slice])
+        elif weight_kind is not None:
+            raise ValueError('Unknown weight_kind: {}'.format(weight_kind))
 
-            # flatten this index to save some memory
-            combine_source_labels = np.ravel_multi_index(
-                (indices_stimuli[indicator_slice], slice_grid_labels), (ea_block['shape'][0], len(grid)))
+        joint_count, independent_count = common_label_count(
+            indices_source[indicator_slice], combine_source_labels, weights=weights)
 
-            weights = None
-            if weight_kind == 'power':
-                weights = np.square(np.abs(c_hat[indicator_slice]))
-            elif weight_kind == 'amplitude':
-                weights = np.abs(c_hat[indicator_slice])
-            elif weight_kind is not None:
-                raise ValueError('Unknown weight_kind: {}'.format(weight_kind))
+    result_queue.put((joint_count, independent_count, grid, grid_labels))
 
-            slice_joint_count, slice_independent_count = common_label_count(
-                indices_source[indicator_slice], combine_source_labels, weights=weights)
 
-            joint_count.append(slice_joint_count)
-            independent_count.append(slice_independent_count)
-            grid_labels.append(slice_grid_labels)
+def _compute_shared_grid_element_counts(ea_path, time_slice_ms=None, weight_kind=None):
+    # we invoke the main counting code in a separate process to workaround a memory leak.
+    # that way, the memory gets cleaned up after each time slice
+    from multiprocessing import get_context
 
-        if has_slices:
-            joint_count = np.array(joint_count)
-            independent_count = np.array(independent_count)
-            grid_labels = np.concatenate(grid_labels)
+    with np.load(ea_path) as ea_block:
+        shape = ea_block['shape']
+
+    has_slices = True
+    if time_slice_ms is None:
+        has_slices = False
+        time_slice_ms = shape[-1]
+
+    if shape[-1] // time_slice_ms * time_slice_ms != shape[-1]:
+        raise ValueError('time_slice_ms must divide epochs exactly. Epoch has {} ms, time_slice_ms is {}'.format(
+            shape[-1], time_slice_ms))
+
+    num_slices = shape[-1] // time_slice_ms
+
+    ctx = get_context()
+    q = ctx.Queue()
+
+    joint_count = list()
+    independent_count = list()
+    grid_labels = list()
+    grid = None
+
+    for index_slice in range(num_slices):
+        p = ctx.Process(
+            target=_local_thread_compute_shared_grid_element_counts,
+            args=(q, ea_path, time_slice_ms, weight_kind, index_slice))
+        p.start()
+        slice_joint_count, slice_independent_count, slice_grid, slice_grid_labels = q.get()
+        if grid is None:
+            grid = slice_grid
         else:
-            joint_count = joint_count[0]
-            independent_count = independent_count[0]
-            grid_labels = grid_labels[0]
+            assert(np.array_equal(grid, slice_grid))
+        joint_count.append(slice_joint_count)
+        independent_count.append(slice_independent_count)
+        grid_labels.append(slice_grid_labels)
+
+    if has_slices:
+        joint_count = np.array(joint_count)
+        independent_count = np.array(independent_count)
+        grid_labels = np.concatenate(grid_labels)
+    else:
+        joint_count = joint_count[0]
+        independent_count = independent_count[0]
+        grid_labels = grid_labels[0]
 
     return joint_count, independent_count, grid, grid_labels
 
 
-def compute_shared_grid_element_counts(element_analysis_dir, subject, time_slice_ms=None, weight_kind=None):
+def compute_shared_grid_element_counts(element_analysis_dir, subjects=None, time_slice_ms=None, weight_kind=None):
     """
     Computes how often two dipoles have events in the same 'grid element'. A grid element divides
     the time-scale plane into boxes that are log-scaled on the scale axis and scaled according to the
@@ -184,7 +212,7 @@ def compute_shared_grid_element_counts(element_analysis_dir, subject, time_slice
     Args:
         element_analysis_dir: The directory where element analysis files can be found. For example:
             '/share/volume0/<your user name>/data_sets/harry_potter/element_analysis'
-        subject: Which subject to run the counts on.
+        subjects: Which subjects to run the counts on. If None, runs on all subjects
         time_slice_ms: If provided, counts are computed within slices of the time spanning this many ms
         weight_kind: 
             If 'power' counts are weighted by the square of the modulus of the wavelet coefficient
@@ -207,39 +235,46 @@ def compute_shared_grid_element_counts(element_analysis_dir, subject, time_slice
         The output also contains the key "blocks", which gives the list of blocks in the output.
     """
 
-    all_blocks = '1', '2', '3', '4'
-
+    if subjects is None:
+        subjects = all_subjects
     result = {'blocks': all_blocks}
     subject_joint_shape = None
     subject_grid = None
-    for block in tqdm(all_blocks):
-        ea_path = os.path.join(
-            element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
-        joint_counts, independent_counts, grid, grid_labels = _compute_shared_grid_element_counts(
-            ea_path, time_slice_ms, weight_kind=weight_kind)
 
-        # try to release some memory
-        gc.collect()
+    for subject in subjects:
+        print('Starting subject {} at {}'.format(subject, datetime.now()))
+        for block in tqdm(all_blocks):
+            ea_path = os.path.join(
+                element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
+            joint_counts, independent_counts, grid, grid_labels = _compute_shared_grid_element_counts(
+                ea_path, time_slice_ms, weight_kind=weight_kind)
 
-        if subject_joint_shape is None:
-            subject_joint_shape = joint_counts.shape
-            subject_grid = grid
-            result['grid'] = grid
+            # try to release some memory
+            gc.collect()
+
+            if subject_joint_shape is None:
+                subject_joint_shape = joint_counts.shape
+                subject_grid = grid
+                result['grid'] = grid
+            else:
+                assert(np.array_equal(subject_joint_shape, joint_counts.shape))
+                assert(np.array_equal(subject_grid, grid))
+
+            result['joint_grid_element_count_{}'.format(block)] = joint_counts
+            result['independent_grid_element_count_{}'.format(block)] = independent_counts
+            result['grid_elements_{}'.format(block)] = grid_labels
+
+        if time_slice_ms is not None:
+            output_file_name = 'harry_potter_shared_grid_element_counts' \
+                               '_{subject}_time_slice_ms_{time_slice_ms}{weight}.npz'
         else:
-            assert(np.array_equal(subject_joint_shape, joint_counts.shape))
-            assert(np.array_equal(subject_grid, grid))
-
-        result['joint_grid_element_count_{}'.format(block)] = joint_counts
-        result['independent_grid_element_count_{}'.format(block)] = independent_counts
-        result['grid_elements_{}'.format(block)] = grid_labels
-
-    if time_slice_ms is not None:
-        output_file_name = 'harry_potter_shared_grid_element_counts_{subject}_time_slice_ms_{time_slice_ms}.npz'
-    else:
-        output_file_name = 'harry_potter_shared_grid_element_counts_{subject}.npz'
-    np.savez(
-        os.path.join(element_analysis_dir, output_file_name.format(
-            subject=subject, time_slice_ms=time_slice_ms)), **result)
+            output_file_name = 'harry_potter_shared_grid_element_counts_{subject}{weight}.npz'
+        np.savez(
+            os.path.join(element_analysis_dir, output_file_name.format(
+                subject=subject,
+                time_slice_ms=time_slice_ms,
+                weight='_{}'.format(weight_kind) if weight_kind is not None else None)),
+            **result)
 
 
 def _renumber_clusters(clusters_in_dipole_order, previous_clusters=None):
@@ -347,8 +382,6 @@ def co_occurrence_source_cluster(
         sample_source_clusters: The cluster corresponding to each event average
         grid_elements: The grid-element corresponding to each event average
     """
-    all_blocks = 1, 2, 3, 4
-
     indices_stimuli = list()
     indices_block = list()
     indices_source = list()
@@ -447,6 +480,9 @@ def co_occurrence_source_cluster(
                     sample_clusters[indicator_slice] = source_clusters_[indices_sources[indicator_slice]]
                 else:
                     sample_clusters[:] = source_clusters_[indices_sources]
+
+            del joint_counts
+            del independent_counts
 
             if time_slice_ms is None:
                 source_clusters = np.squeeze(source_clusters, axis=1)
@@ -831,10 +867,9 @@ def rank_cluster(
             A 2d array with shape (num_stimuli, n_clusters). Note that this contains data for all blocks,
             but the clustering is fit without the held out block.
     """
-    all_blocks = 1, 2, 3, 4
-    all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
+    subjects = all_subjects
     if single_subject is not None:
-        all_subjects = (single_subject,)
+        subjects = (single_subject,)
 
     # subject A has 2 '+' stimuli missing
     a_insert_indices = 1302, 2653
@@ -861,7 +896,7 @@ def rank_cluster(
         multi_subject_source_clusters = list()
         multi_subject_co_occurrence_clusters = list()
 
-        for subject in tqdm(all_subjects, desc='subject', leave=False):
+        for subject in tqdm(subjects, desc='subject', leave=False):
 
             co_occurrence_clustered_path = os.path.join(
                 element_analysis_dir,
@@ -1042,7 +1077,7 @@ def rank_cluster(
                 ms_rank_clusters = np.split(ms_rank_clusters, len(multi_subject_input_aggregates), axis=0)
                 result_data = None
 
-            for idx_subject, (subject, ms_rank_clusters_subject) in enumerate(zip(all_subjects, ms_rank_clusters)):
+            for idx_subject, (subject, ms_rank_clusters_subject) in enumerate(zip(subjects, ms_rank_clusters)):
                 # ms_rank_clusters maps from multi-subject-input-cluster to multi-subject-cluster, so just index into
                 # it with our multi-subject-input-cluster information to replace multi-subject-input-cluster
                 # information with multi-subject-cluster information
@@ -1079,7 +1114,7 @@ def rank_cluster(
     stimuli = list()
     # anyone other than A should be fine for this. Choose the first in all_subjects that is not A, or if
     # that is empty, set to B
-    stimulus_subject = [s for s in all_subjects if s != 'A']
+    stimulus_subject = [s for s in subjects if s != 'A']
     if len(stimulus_subject) > 0:
         stimulus_subject = stimulus_subject[0]
     else:
@@ -1096,7 +1131,7 @@ def rank_cluster(
     for idx in a_insert_indices:
         assert(result['stimuli'][idx]) == '+'
 
-    result['subjects'] = all_subjects
+    result['subjects'] = subjects
 
     if aggregation == 'median' or aggregation == 'counts':
         description_aggregation_co_occurrence = \
