@@ -10,7 +10,8 @@ from tqdm.auto import tqdm
 
 from analytic_wavelet import ElementAnalysisMorse
 from analytic_wavelet_meg import radians_per_ms_from_hertz, PValueFilterFn, maxima_of_transform_mne_source_estimate, \
-    make_grid, assign_grid_labels, common_label_count, kendall_tau, segment_median, segment_combine_events
+    make_grid, assign_grid_labels, common_label_count, kendall_tau, segment_median, segment_combine_events, \
+    stimulus_label_count
 
 all_blocks = 1, 2, 3, 4
 all_subjects = 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'
@@ -238,10 +239,11 @@ def compute_shared_grid_element_counts(element_analysis_dir, subjects=None, time
     if subjects is None:
         subjects = all_subjects
     result = {'blocks': all_blocks}
-    subject_joint_shape = None
-    subject_grid = None
 
     for subject in subjects:
+        subject_joint_shape = None
+        subject_grid = None
+
         print('Starting subject {} at {}'.format(subject, datetime.now()))
         for block in tqdm(all_blocks):
             ea_path = os.path.join(
@@ -277,32 +279,311 @@ def compute_shared_grid_element_counts(element_analysis_dir, subjects=None, time
             **result)
 
 
+def stimulus_grid_counts(element_analysis_dir, subjects=None, grid_ms=25, weight_kind='amplitude'):
+    if subjects is None:
+        subjects = all_subjects
+    result = {'blocks': all_blocks}
+
+    for subject in subjects:
+        subject_counts_shape = None
+        subject_grid = None
+
+        print('Starting subject {} at {}'.format(subject, datetime.now()))
+        for block in tqdm(all_blocks):
+            ea_path = os.path.join(
+                element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
+
+            with np.load(ea_path) as ea_block:
+
+                shape = ea_block['shape']
+                indices_stimuli, indices_source, _, indices_time = np.unravel_index(
+                    ea_block['indices_flat'], shape)
+                scale_frequencies = ea_block['scale_frequencies']
+                ea_morse = ElementAnalysisMorse(
+                    ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
+                c_hat, _, f_hat = ea_morse.event_parameters(
+                    ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
+
+                if grid_ms == 'time_freq':
+                    # noinspection PyTypeChecker
+                    grid = make_grid(
+                        ea_morse, shape[-1], scale_frequencies[np.arange(0, len(scale_frequencies), 10)])
+                else:
+                    grid = list()
+                    for i in range(0, shape[-1], grid_ms):
+                        grid.append(
+                            (i, min(i + grid_ms, shape[-1]),
+                             np.min(scale_frequencies), np.max(scale_frequencies)))
+                    grid = np.array(grid)
+
+                indices_grid = assign_grid_labels(grid, indices_time, f_hat)
+
+            weights = None
+            if weight_kind == 'amplitude':
+                weights = np.abs(c_hat)
+            elif weight_kind == 'power':
+                weights = np.square(np.abs(c_hat))
+            elif weights is not None:
+                raise ValueError('Unknown weight_kind: {}'.format(weight_kind))
+
+            counts = stimulus_label_count(
+                indices_stimuli,
+                np.ravel_multi_index((indices_source, indices_grid), (shape[1], len(grid))),
+                weights=weights)
+
+            counts = np.reshape(counts, (shape[0], shape[1], len(grid)))
+
+            if subject_counts_shape is None:
+                subject_counts_shape = counts.shape[1:]
+                subject_grid = grid
+                result['grid'] = grid
+            else:
+                assert (np.array_equal(subject_counts_shape, counts.shape[1:]))
+                assert (np.array_equal(subject_grid, grid))
+
+            result['counts_{}'.format(block)] = counts
+            result['grid_elements_{}'.format(block)] = indices_grid
+
+        output_file_name = 'harry_potter_stimulus_grid_element_counts' \
+                           '_{subject}_grid_{grid_ms}{weight}.npz'
+        np.savez(
+            os.path.join(element_analysis_dir, output_file_name.format(
+                subject=subject,
+                grid_ms=grid_ms,
+                weight='_{}'.format(weight_kind) if weight_kind is not None else None)),
+            **result)
+
+
 def _renumber_clusters(clusters_in_dipole_order, previous_clusters=None):
     if previous_clusters is not None:
         # use overlap to keep consistency across slices
         from scipy.optimize import linear_sum_assignment
         if not np.array_equal(clusters_in_dipole_order.shape, previous_clusters.shape):
             raise ValueError('previous_clusters must have the same shape as clusters_in_dipole_order')
-        overlap = np.zeros((np.max(clusters_in_dipole_order) + 1, np.max(previous_clusters) + 1), np.intp)
-        if overlap.shape[0] != overlap.shape[1]:
+        num_current = np.max(clusters_in_dipole_order) + 1
+        num_previous = np.max(previous_clusters) + 1
+        if num_current != num_previous:
             raise ValueError('clusters_in_dipole_order and previous_clusters must have the same range')
+        overlap = np.zeros((num_current, num_previous), np.intp)
+        # allow things to be 'unassigned' by having negative values
+        indicator_valid = np.reshape(np.logical_and(clusters_in_dipole_order >= 0, previous_clusters >= 0), -1)
         pair_indices, overlap_ = np.unique(
             np.ravel_multi_index((
-                np.reshape(clusters_in_dipole_order, -1), np.reshape(previous_clusters, -1)), overlap.shape),
+                np.reshape(clusters_in_dipole_order, -1)[indicator_valid],
+                np.reshape(previous_clusters, -1)[indicator_valid]), overlap.shape),
             return_counts=True)
         overlap[np.unravel_index(pair_indices, overlap.shape)] = overlap_
         _, new_numbers = linear_sum_assignment(np.max(overlap) - overlap)
-        return new_numbers[clusters_in_dipole_order]
+        return np.where(
+            clusters_in_dipole_order >= 0,
+            np.reshape(
+                new_numbers[np.reshape(np.where(clusters_in_dipole_order >= 0, clusters_in_dipole_order, 0), -1)],
+                clusters_in_dipole_order.shape),
+            clusters_in_dipole_order)
     else:
         # use dipole order to try to keep consistency across runs
-        indices_sort = np.argsort(clusters_in_dipole_order)
-        cluster_cum_count = np.cumsum(np.bincount(clusters_in_dipole_order))
+        shape = clusters_in_dipole_order.shape
+        clusters_in_dipole_order = np.reshape(clusters_in_dipole_order, -1)
+        indicator_valid = clusters_in_dipole_order >= 0
+        clusters_in_dipole_order_ = clusters_in_dipole_order[indicator_valid]
+        indices_sort = np.argsort(clusters_in_dipole_order_)
+        cluster_cum_count = np.cumsum(np.bincount(clusters_in_dipole_order_))
         median_ranks = list()
         for i in range(len(cluster_cum_count)):
             start = 0 if i == 0 else cluster_cum_count[i - 1]
             median_ranks.append(np.median(indices_sort[start:cluster_cum_count[i]]))
         new_numbers = np.argsort(np.array(median_ranks))
-        return new_numbers[clusters_in_dipole_order]
+        clusters_in_dipole_order_ = new_numbers[clusters_in_dipole_order_]
+        clusters_in_dipole_order = np.copy(clusters_in_dipole_order)
+        clusters_in_dipole_order[indicator_valid] = clusters_in_dipole_order_
+        return np.reshape(clusters_in_dipole_order, shape)
+
+
+def gather_direct_rank_clusters(element_analysis_dir, grid_ms, aggregation='sum'):
+
+    # subject A has 2 '+' stimuli missing
+    a_insert_indices = 1302, 2653
+
+    result = dict()
+    for subject in all_subjects:
+
+        print('Starting subject {} at {}'.format(subject, datetime.now()))
+
+        indices_stimuli = list()
+        indices_block = list()
+        indices_source = list()
+        indices_time = list()
+        c_hat = list()
+        f_hat = list()
+        for block in all_blocks:
+            ea_path = os.path.join(
+                element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
+            with np.load(ea_path) as ea_block:
+                shape = ea_block['shape']
+                scale_frequencies = ea_block['scale_frequencies']
+                ea_morse = ElementAnalysisMorse(
+                    ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
+
+                if grid_ms == 'time_freq':
+                    # noinspection PyTypeChecker
+                    grid = make_grid(ea_morse, shape[-1], scale_frequencies[np.arange(0, len(scale_frequencies), 10)])
+                else:
+                    grid = list()
+                    grid_ms = int(grid_ms)
+                    for i in range(0, shape[-1], grid_ms):
+                        grid.append(
+                            (i, min(i + grid_ms, shape[-1]),
+                             np.min(scale_frequencies), np.max(scale_frequencies)))
+                    grid = np.array(grid)
+
+                if 'grid' in result:
+                    assert(np.array_equal(result['grid'], grid))
+                else:
+                    result['grid'] = grid
+
+                indices_stimuli_block, indices_source_block, _, indices_time_block = np.unravel_index(
+                    ea_block['indices_flat'], ea_block['shape'])
+                indices_stimuli.append(indices_stimuli_block)
+                indices_block.append(
+                    np.array([block] * len(indices_stimuli_block), dtype=indices_stimuli_block.dtype))
+                indices_source.append(indices_source_block)
+                indices_time.append(indices_time_block)
+
+                c_hat_block, _, f_hat_block = ea_morse.event_parameters(
+                    ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
+                c_hat.append(c_hat_block)
+                f_hat.append(f_hat_block)
+
+        indices_stimuli_orig = np.concatenate(indices_stimuli)
+        indices_block_orig = np.concatenate(indices_block)
+        indices_sources = np.concatenate(indices_source)
+        indices_time = np.concatenate(indices_time)
+        c_hat = np.concatenate(c_hat)
+        f_hat = np.concatenate(f_hat)
+        indices_grid = assign_grid_labels(result['grid'], indices_time, f_hat)
+        n_clusters = None
+
+        for hold_out_block in tqdm(all_blocks):
+            source_clusters = None
+            sample_clusters = None
+
+            for index_grid in range(len(grid)):
+                if aggregation in ('sum', 'mean'):
+                    kind = 'amplitude'
+                elif aggregation in ('L2', 'rms'):
+                    kind = 'power'
+                elif aggregation == 'counts':
+                    kind = 'count'
+                else:
+                    kind = aggregation
+                cluster_path = os.path.join(
+                    element_analysis_dir,
+                    'kendall_tau',
+                    'harry_potter_direct_rank_cluster_{}_{}_{}_{}.npz'.format(
+                        subject, hold_out_block, index_grid, kind))
+                if not os.path.exists(cluster_path) and kind == 'amplitude':
+                    cluster_path = os.path.join(
+                        element_analysis_dir,
+                        'kendall_tau',
+                        'harry_potter_direct_rank_cluster_{}_{}_{}.npz'.format(
+                            subject, hold_out_block, index_grid))
+                with np.load(cluster_path) as cluster_data:
+                    source_clusters_ = cluster_data['clusters']
+                if n_clusters is None:
+                    n_clusters = np.max(source_clusters_) + 1
+                else:
+                    assert(n_clusters == np.max(source_clusters_) + 1)
+
+                # renumber the clusters here according to dipole order to
+                # try to keep the same cluster numbers across runs
+                if source_clusters is None:
+                    source_clusters_ = _renumber_clusters(source_clusters_)
+                    source_clusters = np.full((len(source_clusters_), len(grid)), -1, dtype=source_clusters_.dtype)
+                    sample_clusters = np.full(len(indices_sources), -1, dtype=source_clusters.dtype)
+                else:
+                    source_clusters_ = _renumber_clusters(
+                        source_clusters_, source_clusters[:, index_grid - 1] - (index_grid - 1) * n_clusters)
+                source_clusters[:, index_grid] = source_clusters_ + index_grid * n_clusters
+                indicator_match = index_grid == indices_grid
+                sample_clusters[indicator_match] = source_clusters[indices_sources[indicator_match], index_grid]
+
+            segments = (indices_block_orig, indices_stimuli_orig, sample_clusters)
+
+            mean_w_segment = None
+            if aggregation == 'median' or aggregation == 'percentile_75':
+                c_hat_val = np.abs(c_hat)
+                if aggregation == 'percentile_75':
+                    c_hat_val = (c_hat_val, 0.75)
+
+                segments, segment_counts, w_segment = segment_median(segments, c_hat_val)
+            elif aggregation in ('sum', 'mean', 'L2', 'rms', 'counts'):
+                segments, segment_counts, w_segment, mean_w_segment = segment_combine_events(
+                    segments, c_hat, use_amplitude=aggregation in ('sum', 'mean'))
+            else:
+                raise ValueError('Unrecognized aggregation: {}'.format(aggregation))
+
+            indices_block, indices_stimuli, indices_cluster = segments
+
+            block_stimuli, indices_virtual_stimuli = np.unique(
+                np.concatenate([np.expand_dims(indices_block, 1), np.expand_dims(indices_stimuli, 1)], axis=1),
+                axis=0, return_inverse=True)
+
+            dense = np.full((len(block_stimuli), n_clusters * len(grid)), np.nan, dtype=w_segment.dtype)
+            if aggregation == 'mean' or aggregation == 'rms':
+                dense[(indices_virtual_stimuli, indices_cluster)] = mean_w_segment
+            elif aggregation == 'counts':
+                dense[(indices_virtual_stimuli, indices_cluster)] = segment_counts
+            else:
+                dense[(indices_virtual_stimuli, indices_cluster)] = w_segment
+
+            if subject == 'A':
+                dense = dense.T
+                for idx in a_insert_indices:
+                    block_stimuli, dense = _insert_missing(block_stimuli, dense, idx)
+                dense = dense.T
+
+            indices_block = block_stimuli[:, 0]
+            indices_stimuli = block_stimuli[:, 1]
+
+            result['source_rank_clusters_{}_hold_out_{}'.format(subject, hold_out_block)] = source_clusters
+            result['data_{}_hold_out_{}'.format(subject, hold_out_block)] = dense
+
+            if 'stimuli' in result:
+                assert np.array_equal(result['stimuli'], indices_stimuli)
+                assert np.array_equal(result['blocks'], indices_block)
+            else:
+                result['stimuli'] = indices_stimuli
+                result['blocks'] = indices_block
+
+    # convert stimuli from indices into text for convenience
+    stimuli = list()
+    # anyone other than A should be fine for this. Choose the first in all_subjects that is not A, or if
+    # that is empty, set to B
+    stimulus_subject = [s for s in all_subjects if s != 'A']
+    if len(stimulus_subject) > 0:
+        stimulus_subject = stimulus_subject[0]
+    else:
+        stimulus_subject = 'B'
+    for block in all_blocks:
+        ea_path = os.path.join(
+            element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(stimulus_subject, block))
+        with np.load(ea_path) as ea_block:
+            ea_stimuli = ea_block['stimuli']
+            stimuli.append(ea_stimuli[result['stimuli'][result['blocks'] == block]])
+    result['stimuli'] = np.concatenate(stimuli)
+
+    # check that data we inserted is at '+'
+    for idx in a_insert_indices:
+        assert (result['stimuli'][idx]) == '+'
+
+    result['subjects'] = all_subjects
+
+    output_path = os.path.join(
+        element_analysis_dir,
+        'harry_potter_meg_direct_rank_clustered'
+        '_{aggregation}_{grid_ms}.npz'.format(aggregation=aggregation, grid_ms=grid_ms))
+
+    np.savez(output_path, **result)
 
 
 def co_occurrence_source_cluster(
@@ -680,82 +961,98 @@ def _rank_cluster_helper(
     return tuple(result)
 
 
-def rank_cluster_only_combine_block(element_analysis_dir, subject, block, grid, source_rank_clusters, aggregation):
-    """
-    Computes aggregate events for each (source, rank-cluster) tuple bypassing co-occurrence cluster aggregation. This
-    can be useful for comparing a predicted result to a ground-truth value at each dipole.
-    Args:
-        element_analysis_dir: The directory where element analysis files can be found. For example:
-            '/share/volume0/<your user name>/data_sets/harry_potter/element_analysis'
-        subject: Which subject to compute the events for.
-        block: Which block to compute the events for.
-        grid: The time-frequency grid, available in the rank-cluster file as 'grid'
-        source_rank_clusters: A 2d array of shape (num_dipoles, num_grid_elements) giving the rank-cluster assignment
-            for each (source, grid-element) tuple. Available in the rank-cluster file as
-            'source_rank_clusters_<subject>_hold_out_<held-out-block>'
-        aggregation:
-            If 'median', uses the median absolute wavelet coefficient of the events in all dipoles belonging to a
-                rank cluster as the value for that cluster for an epoch.
-            If 'counts', uses the total number of events in all dipoles belonging to a rank cluster as the value for
-                that cluster for an epoch.
-            If 'rms', uses the root-mean-squared absolute wavelet coefficient of all events in all dipoles belonging to
-                a rank cluster as the value for that cluster for an epoch.
-            If 'L2' (default), uses the L2-norm of the absolute wavelet coefficient of all events in all dipoles
-                belonging to a rank cluster as the value for that cluster for an epoch.
-            If 'mean', uses the mean of the absolute wavelet coefficient of all events in all dipoles
-                belonging to a rank cluster as the value for that cluster for an epoch.
-            If 'sum', uses the total of the absolute wavelet coefficient of all events in all dipoles
-                belonging to a rank cluster as the value for that cluster for an epoch.
-    Returns:
-        combined_events: A 3d array with shape (num_epochs, num_sources, num_rank_clusters) containing the aggregated
-            events
-    """
-    ea_path = os.path.join(
-        element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
-    with np.load(ea_path) as ea_block:
-        indices_stimuli, indices_source, _, indices_time = np.unravel_index(
-            ea_block['indices_flat'], ea_block['shape'])
-        ea_morse = ElementAnalysisMorse(ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
-        c_hat, _, f_hat = ea_morse.event_parameters(
-            ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
+def dipole_aggregate(element_analysis_dir, subject, grid_ms, aggregation):
+
+    indices_stimuli = list()
+    indices_block = list()
+    indices_source = list()
+    indices_time = list()
+    c_hat = list()
+    f_hat = list()
+    grid = None
+    for block in all_blocks:
+        ea_path = os.path.join(
+            element_analysis_dir, 'harry_potter_element_analysis_{}_{}.npz'.format(subject, block))
+        with np.load(ea_path) as ea_block:
+            shape = ea_block['shape']
+            scale_frequencies = ea_block['scale_frequencies']
+            ea_morse = ElementAnalysisMorse(
+                ea_block['gamma'], ea_block['analyzing_beta'], ea_block['element_beta'])
+
+            if grid_ms == 'time_freq':
+                # noinspection PyTypeChecker
+                grid_ = make_grid(ea_morse, shape[-1], scale_frequencies[np.arange(0, len(scale_frequencies), 10)])
+            else:
+                grid_ = list()
+                grid_ms = int(grid_ms)
+                for i in range(0, shape[-1], grid_ms):
+                    grid_.append(
+                        (i, min(i + grid_ms, shape[-1]),
+                         np.min(scale_frequencies), np.max(scale_frequencies)))
+                grid_ = np.array(grid_)
+
+            if grid is None:
+                grid = grid_
+            else:
+                assert (np.array_equal(grid, grid_))
+
+            indices_stimuli_block, indices_source_block, _, indices_time_block = np.unravel_index(
+                ea_block['indices_flat'], ea_block['shape'])
+            indices_stimuli.append(indices_stimuli_block)
+            indices_block.append(
+                np.array([block] * len(indices_stimuli_block), dtype=indices_stimuli_block.dtype))
+            indices_source.append(indices_source_block)
+            indices_time.append(indices_time_block)
+
+            c_hat_block, _, f_hat_block = ea_morse.event_parameters(
+                ea_block['maxima_coefficients'], ea_block['interpolated_scale_frequencies'])
+            c_hat.append(c_hat_block)
+            f_hat.append(f_hat_block)
+
+    indices_stimuli = np.concatenate(indices_stimuli)
+    indices_block = np.concatenate(indices_block)
+    indices_sources = np.concatenate(indices_source)
+    indices_time = np.concatenate(indices_time)
+    c_hat = np.concatenate(c_hat)
+    f_hat = np.concatenate(f_hat)
     indices_grid = assign_grid_labels(grid, indices_time, f_hat)
-    del indices_time
-    del f_hat
-    indices_cluster = source_rank_clusters[(indices_source, indices_grid)]
-    del indices_grid
 
-    segments = np.concatenate([
-        np.expand_dims(indices_stimuli, 1),
-        np.expand_dims(indices_source, 1),
-        np.expand_dims(indices_cluster, 1)], axis=1)
+    segments = (indices_block, indices_stimuli, indices_sources, indices_grid)
 
-    dense_array = np.full(
-        (np.max(indices_stimuli) + 1, np.max(indices_source) + 1, np.max(indices_cluster) + 1), np.nan)
+    if aggregation == 'median' or aggregation == 'percentile_75':
+        c_hat_val = np.abs(c_hat)
+        if aggregation == 'percentile_75':
+            c_hat_val = (c_hat_val, 0.75)
 
-    if aggregation == 'counts':
-        unique_segments, counts = np.unique(segments, axis=0, return_counts=True)
-        dense_array[(
-            unique_segments[:, 0], unique_segments[:, 1], unique_segments[:, 2])] = counts
-    elif aggregation == 'median':
-        unique_segments, _, w = segment_median(segments, np.abs(c_hat))
-        dense_array[(
-            unique_segments[:, 0], unique_segments[:, 1], unique_segments[:, 2])] = w
-    elif aggregation == 'L2' or aggregation == 'rms':
-        unique_segments, _, w, w_rms = segment_combine_events(segments, c_hat)
-        if aggregation == 'rms':
-            w = w_rms
-        dense_array[(
-            unique_segments[:, 0], unique_segments[:, 1], unique_segments[:, 2])] = w
-    elif aggregation == 'sum' or aggregation == 'mean':
-        unique_segments, _, w, w_mean = segment_combine_events(segments, c_hat, use_amplitude=True)
-        if aggregation == 'mean':
-            w = w_mean
-        dense_array[(
-            unique_segments[:, 0], unique_segments[:, 1], unique_segments[:, 2])] = w
+        segments, _, w_segment = segment_median(segments, c_hat_val)
+        result = w_segment
+    elif aggregation in ('sum', 'mean', 'L2', 'rms', 'counts'):
+        segments, segment_counts, w_segment, mean_w_segment = segment_combine_events(
+            segments, c_hat, use_amplitude=aggregation in ('sum', 'mean'))
+        if aggregation in ('sum', 'L2'):
+            result = w_segment
+        elif aggregation in ('mean', 'rms'):
+            result = mean_w_segment
+        elif aggregation == 'counts':
+            result = segment_counts
+        else:
+            raise ValueError('Unrecognized aggregation: {}'.format(aggregation))
     else:
-        raise ValueError('Unrecognized mode: {}'.format(aggregation))
+        raise ValueError('Unrecognized aggregation: {}'.format(aggregation))
 
-    return dense_array
+    indices_block, indices_stimuli, indices_sources, indices_grid = segments
+
+    offsets = np.cumsum([0] + list(np.max(indices_stimuli[indices_block == b]) + 1 for b in all_blocks))[:-1]
+    word_ids = offsets[indices_block - 1] + indices_stimuli
+    if subject == 'A':
+        # subject A has 2 '+' stimuli missing
+        word_ids = np.where(word_ids > 2653, word_ids + 2, np.where(word_ids > 1302, word_ids + 1, word_ids))
+
+    shape = tuple(np.max(s) + 1 for s in (word_ids, indices_sources, indices_grid))
+    result_ = np.full(shape, np.nan, dtype=result.dtype)
+    result_[(word_ids, indices_sources, indices_grid)] = result
+
+    return result_
 
 
 def rank_cluster(

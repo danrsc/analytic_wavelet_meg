@@ -17,6 +17,7 @@ __all__ = [
     'hertz_from_radians_per_ms',
     'radians_per_ms_from_hertz',
     'common_label_count',
+    'stimulus_label_count',
     'make_grid',
     'assign_grid_labels']
 
@@ -395,7 +396,11 @@ def make_grid(ea_morse, num_timepoints, scale_frequencies):
     return np.array(grid)
 
 
-def assign_grid_labels(grid, indices_time, f_hat):
+def assign_grid_labels(
+        grid, indices_time, f_hat,
+        enforce_upper_frequency_bound=False,
+        enforce_lower_frequency_bound=False,
+        allow_unassigned=False):
     """
     Assigns to each point described by the coordinates (indices_time, f_hat) a grid-element label indicating which
     grid-element the point belongs to, where grid is computed by make_grid. Points which have a higher frequency than
@@ -407,7 +412,9 @@ def assign_grid_labels(grid, indices_time, f_hat):
             (lower_time, upper_time, lower_freq, upper_freq). Typically computed by make_grid
         indices_time: The time coordinates of each point.
         f_hat: The frequency coordinates of each point (in radians).
-
+        enforce_upper_frequency_bound: If True, points outside of the upper-most frequency bound are assigned -1
+        enforce_lower_frequency_bound: If True, points outside of the lower-most frequency bound are assigned -1
+        allow_unassigned: If not set, then when any points are not assigned to a grid element a ValueError is raised
     Returns:
         grid_assignments: A 1d array of grid labels between 0 and num_grid_elements which is the same length
             as indices_time
@@ -418,13 +425,17 @@ def assign_grid_labels(grid, indices_time, f_hat):
     min_lower_bound = np.min(grid[:, 2])
     for index_grid, grid_element in enumerate(grid):
         indicator_element = np.logical_and(indices_time >= grid_element[0], indices_time < grid_element[1])
-        if grid_element[3] != max_upper_bound:  # no upper bound on frequency for the highest frequency
+        if enforce_upper_frequency_bound or grid_element[3] != max_upper_bound:
+            # no upper bound on frequency for the highest frequency
             indicator_element = np.logical_and(indicator_element, f_hat < grid_element[3])
-        if grid_element[2] != min_lower_bound:  # no lower bound on frequency for the lowest frequency
+        if enforce_lower_frequency_bound or grid_element[2] != min_lower_bound:
+            # no lower bound on frequency for the lowest frequency
             indicator_element = np.logical_and(indicator_element, f_hat >= grid_element[2])
         grid_assignments[indicator_element] = index_grid
 
-    assert (np.all(grid_assignments >= 0))
+    if not allow_unassigned:
+        if not np.all(grid_assignments >= 0):
+            raise ValueError('Some points do not fall within the given grid.')
 
     return grid_assignments
 
@@ -494,3 +505,23 @@ def common_label_count(indices_source, indices_label, weights=None):
     joint_counts = _numba_sum_min(counts)
 
     return joint_counts, independent_counts
+
+
+def stimulus_label_count(indices_stimuli, indices_label, weights=None):
+    """
+    Computes the counts for each stimulus at each label.
+    Args:
+        indices_stimuli: A 1d array of stimuli indices
+        indices_label: A 1d array of label indices
+        weights: If provided, a 1d array of weights which will be summed instead of just counting occurrences
+
+    Returns:
+        A 2d array of shape (num_stimuli, num_labels) containing either the counts or the summed weights
+    """
+    num_stimuli = np.max(indices_stimuli) + 1
+    num_labels = np.max(indices_label) + 1
+    counts = _numba_bincount(
+        np.ravel_multi_index((indices_stimuli, indices_label), (num_stimuli, num_labels)), weights=weights)
+    if len(counts) < num_stimuli * num_labels:
+        counts = np.pad(counts, (0, num_stimuli * num_labels - len(counts)))
+    return np.reshape(counts, (num_stimuli, num_labels))
